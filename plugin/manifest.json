@@ -1,0 +1,72 @@
+{
+  "id": "com.comfyshop.panel",
+  "name": "ComfyShop",
+  "version": "1.0.0",
+  "main": "index.html",
+  "manifestVersion": 5,
+  "host": {
+    "app": "PS",
+    "minVersion": "25.0.0"
+  },
+  "requiredPermissions": {
+    "network": {
+      "domains": "all"
+    },
+    "localFileSystem": "fullAccess"
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "main",
+      "label": {
+        "default": "ComfyShop"
+      },
+      "minimumSize": {
+        "width": 280,
+        "height": 200
+      },
+      "maximumSize": {
+        "width": 1600,
+        "height": 1600
+      },
+      "preferredDockedSize": {
+        "width": 320,
+        "height": 520
+      },
+      "preferredFloatingSize": {
+        "width": 340,
+        "height": 560
+      },
+      "icons": [
+        {
+          "width": 23,
+          "height": 23,
+          "path": "icons/icon_dark.png",
+          "scale": [1, 2],
+          "theme": ["darkest", "dark", "medium"]
+        },
+        {
+          "width": 23,
+          "height": 23,
+          "path": "icons/icon_light.png",
+          "scale": [1, 2],
+          "theme": ["lightest", "light"]
+        }
+      ]
+    },
+    {
+      "type": "command",
+      "id": "generate",
+      "label": {
+        "default": "Generate (last settings)"
+      }
+    },
+    {
+      "type": "command",
+      "id": "selftest",
+      "label": {
+        "default": "Self test (export + new layer)"
+      }
+    }
+  ]
+}

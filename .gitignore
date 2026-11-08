@@ -1,0 +1,17 @@
+# Reference clone, local test output, and environment-specific files
+sd-ppp-main/
+backup_external_1.0.0/
+out/
+.object_info.json
+testinput.jpg
+
+# Logs and editor/OS noise
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Node tooling
+node_modules/
+npm-debug.log*
