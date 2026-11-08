@@ -2,6 +2,7 @@
 sd-ppp-main/
 backup_external_1.0.0/
 out/
+dist/
 .object_info.json
 testinput.jpg
 
