@@ -116,6 +116,12 @@ if ($EnableDeveloperMode) {
     }
 }
 
+$developerSettings = Join-Path $env:CommonProgramFiles 'Adobe\UXP\Developer\settings.json'
+if (-not (Test-Path $developerSettings)) {
+    Write-Warning "UXP Developer Mode does not look enabled. Enable it once in the UXP Developer Tool,"
+    Write-Warning "or run this installer as administrator with -EnableDeveloperMode."
+}
+
 Write-Host ""
 Write-Host "Installed $pluginName $version"
 Write-Host "  plugin:       $target"
