@@ -532,6 +532,10 @@ input[type="checkbox"] {
   color: #ff9a9a;
 }
 
+.cs-log .warn {
+  color: #e8c47a;
+}
+
 .cs-log .ok {
   color: #86d986;
 }

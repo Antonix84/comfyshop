@@ -33,17 +33,52 @@
     return s;
   }
 
+  function isPlain(v) {
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+  }
+
+  /* ComfyUI answers /prompt with { error, node_errors } - turn that blob
+   * into something a human can act on instead of a wall of JSON. */
+  function formatPromptError(json) {
+    var lines = [];
+    var err = json && json.error;
+    if (err && (err.message || err.type)) lines.push(String(err.message || err.type));
+    if (err && err.details) lines.push(String(err.details));
+    var nodeErrors = json && json.node_errors;
+    if (isPlain(nodeErrors)) {
+      Object.keys(nodeErrors).forEach(function (nodeId) {
+        var errs = nodeErrors[nodeId] || {};
+        var meta = (errs._meta && (errs._meta.name || errs._meta.type)) || ('node #' + nodeId);
+        (errs.errors || []).forEach(function (e) {
+          var bits = [meta];
+          if (e.type) bits.push(e.type);
+          if (e.message) bits.push(String(e.message));
+          if (e.input_name) bits.push('input "' + e.input_name + '"');
+          if (e.value !== undefined && e.value !== null) bits.push('value: ' + JSON.stringify(e.value));
+          if (Array.isArray(e.input_config)) bits.push('expected: ' + JSON.stringify(e.input_config[0]));
+          lines.push('- ' + bits.join(': '));
+        });
+      });
+    }
+    return lines.filter(Boolean).join('\n');
+  }
+
   async function readError(res) {
     var text = '';
     try { text = await res.text(); } catch (e) { /* ignore */ }
-    var detail = text;
+    var parsed = null;
+    var friendly = '';
     try {
-      var json = JSON.parse(text);
-      if (json && json.error) {
-        detail = (json.error.message || json.error.type || '') + ' ' + text;
-      }
+      parsed = JSON.parse(text);
+      friendly = formatPromptError(parsed);
     } catch (e) { /* not json */ }
-    return new Error('ComfyUI HTTP ' + res.status + (detail ? ': ' + String(detail).slice(0, 600) : ''));
+    var detail = friendly || text;
+    var error = new Error('ComfyUI HTTP ' + res.status +
+      (detail ? ': ' + String(detail).slice(0, 600) : ''));
+    error.status = res.status;
+    error.details = parsed || text;
+    error.nodeErrors = parsed && parsed.node_errors;
+    return error;
   }
 
   async function getJson(host, path) {
@@ -144,8 +179,27 @@
       headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary },
       body: body
     });
-    if (!res.ok) throw await readError(res);
-    return res.json();
+    if (!res.ok) {
+      /* very old servers only expose /input */
+      var fallback = await fetch(normalizeHost(host) + '/input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary },
+        body: body
+      });
+      if (!fallback.ok) throw await readError(res);
+      var fallbackInfo = await fallback.json();
+      return {
+        name: fallbackInfo.name || name,
+        subfolder: fallbackInfo.subfolder || options.subfolder || '',
+        type: fallbackInfo.type || 'input'
+      };
+    }
+    var info = await res.json();
+    return {
+      name: info.name || name,
+      subfolder: info.subfolder || options.subfolder || '',
+      type: info.type || 'input'
+    };
   }
 
   async function queuePrompt(host, prompt, clientId) {
@@ -164,8 +218,71 @@
     return postJson(host, '/interrupt', {});
   }
 
+  /* Remove a queued/running prompt, then interrupt the worker. */
+  async function cancelPrompt(host, promptId) {
+    try {
+      await postJson(host, '/queue', { delete: promptId ? [promptId] : [] });
+    } catch (e) { /* older servers only support /interrupt */ }
+    try { return await interrupt(host); } catch (e) { return {}; }
+  }
+
+  async function clearQueue(host) {
+    try { return await postJson(host, '/queue', { clear: true }); } catch (e) { return {}; }
+  }
+
   async function deleteQueueItems(host) {
-    return postJson(host, '/queue', { clear: true });
+    return clearQueue(host);
+  }
+
+  var IMAGE_KEYS = ['images', 'gifs', 'videos'];
+
+  var IMAGE_KEYS = ['images', 'gifs', 'videos'];
+
+  function openSocket(host, clientId) {
+    var socket = { ws: null, handler: null, queue: [], ready: Promise.resolve(false) };
+    if (typeof WebSocket === 'undefined') return socket;
+
+    var resolveReady = function () { };
+    socket.ready = new Promise(function (resolve) { resolveReady = resolve; });
+    var settled = false;
+    function settle(value) {
+      if (settled) return;
+      settled = true;
+      if (socket.timer) { clearTimeout(socket.timer); socket.timer = null; }
+      resolveReady(value);
+    }
+
+    try {
+      var ws = new WebSocket(wsUrl(host) + '/ws?clientId=' + encodeURIComponent(clientId || 'comfyshop'));
+      socket.ws = ws;
+      if ('binaryType' in ws) { try { ws.binaryType = 'arraybuffer'; } catch (e) { /* ignore */ } }
+      socket.timer = setTimeout(function () { settle(false); }, 2000);
+      ws.onopen = function () { settle(true); };
+      ws.onerror = function () { settle(false); };
+      ws.onclose = function () { settle(false); };
+      ws.onmessage = function (event) {
+        var payload = event && event.data !== undefined ? event.data : event;
+        if (payload && typeof payload !== 'string') {
+          try { payload = String(payload); } catch (e) { return; }
+        }
+        if (socket.handler) {
+          socket.handler(payload);
+        } else {
+          socket.queue.push(payload);
+          if (socket.queue.length > 300) socket.queue.shift();
+        }
+      };
+    } catch (e) {
+      socket.ws = null;
+      settle(false);
+    }
+    return socket;
+  }
+
+  function closeSocket(socket) {
+    if (!socket || !socket.ws) return;
+    try { socket.ws.close(); } catch (e) { /* ignore */ }
+    socket.ws = null;
   }
 
   function imagesOf(historyEntry) {
@@ -173,12 +290,23 @@
     if (!historyEntry || !historyEntry.outputs) return images;
     var outputs = historyEntry.outputs;
     Object.keys(outputs).forEach(function (nodeId) {
-      var out = outputs[nodeId];
-      if (out && Array.isArray(out.images)) {
-        out.images.forEach(function (img) {
-          images.push({ nodeId: nodeId, filename: img.filename, subfolder: img.subfolder || '', type: img.type || 'output', animated: !!img.animated });
+      var out = outputs[nodeId] || {};
+      IMAGE_KEYS.forEach(function (key) {
+        var list = out[key];
+        if (!Array.isArray(list)) return;
+        list.forEach(function (img) {
+          if (!img || !img.filename) return;
+          images.push({
+            nodeId: nodeId,
+            key: key,
+            filename: img.filename,
+            subfolder: img.subfolder || '',
+            type: img.type || 'output',
+            format: img.format || '',
+            animated: !!img.animated
+          });
         });
-      }
+      });
     });
     return images;
   }
@@ -201,19 +329,25 @@
    * Uses the websocket for progress and completion; history polling is a
    * safety net (and the only mechanism if websockets are unavailable).
    *
-   * handlers: { onProgress(percent, nodeId), onExecuting(nodeId), onStatus(text) }
+   * handlers: { onProgress(percent, nodeId), onExecuting(nodeId), onStatus(text),
+   *             onQueued(position), timeoutMs, shouldCancel(), socket }
    */
   async function waitForPrompt(host, promptId, clientId, handlers) {
     handlers = handlers || {};
     var finished = null;
-    var progress = {};
-    var ws = null;
     var wsDone = false;
-    var wsPollsAfterDone = 0;
+    var pollsWithoutHistory = 0;
+    var socket = handlers.socket || openSocket(host, clientId);
 
     function report(pct, node) {
       if (handlers.onProgress) {
         try { handlers.onProgress(pct, node); } catch (e) { /* ignore */ }
+      }
+    }
+
+    function status(text) {
+      if (handlers.onStatus) {
+        try { handlers.onStatus(text); } catch (e) { /* ignore */ }
       }
     }
 
@@ -222,106 +356,125 @@
       finished = { value: value, error: error };
     }
 
-    if (typeof WebSocket !== 'undefined') {
-      try {
-        ws = new WebSocket(wsUrl(host) + '/ws?clientId=' + encodeURIComponent(clientId || 'comfyshop'));
-        ws.onmessage = function (event) {
-          var msg;
-          try { msg = JSON.parse(event.data); } catch (e) { return; }
-          var data = msg.data || {};
-          if (data.prompt_id && promptId && data.prompt_id !== promptId) return;
+    function handleWsPayload(raw) {
+      if (typeof raw !== 'string') return;
+      var msg;
+      try { msg = JSON.parse(raw); } catch (e) { return; }
+      if (raw.indexOf('"type"') < 0 && raw.indexOf('"type":') < 0) return;
+      var data = msg.data || {};
+      if (data.prompt_id && promptId && String(data.prompt_id) !== String(promptId)) return;
 
-          if (msg.type === 'execution_start') {
-            report(1, null);
-            if (handlers.onStatus) handlers.onStatus('started');
-          } else if (msg.type === 'executing') {
-            if (data.node) {
-              if (handlers.onExecuting) handlers.onExecuting(data.node);
-              report(null, data.node);
-            } else if (data.node === null) {
-              // execution finished (older servers signal this way)
+      switch (msg.type) {
+        case 'execution_start':
+          report(1, null);
+          status('started');
+          break;
+        case 'executing':
+          if (data.node) {
+            if (handlers.onExecuting) {
+              try { handlers.onExecuting(data.node); } catch (e) { /* ignore */ }
             }
-          } else if (msg.type === 'progress') {
-            var max = data.max || 0;
-            var value = data.value || 0;
-            if (max > 0) {
-              var pct = Math.max(1, Math.min(99, Math.round((value / max) * 100)));
-              report(pct, data.node);
-            }
-          } else if (msg.type === 'executed') {
-            if (data.node) {
-              progress[data.node] = true;
-            }
-          } else if (msg.type === 'execution_error') {
-            var err = new Error(data.exception_message || data.exception_type || 'ComfyUI execution error');
-            err.details = data;
-            finish(null, err);
-          } else if (msg.type === 'execution_success') {
-            // History may not be written yet - the polling loop below picks
-            // up the actual outputs.
+            report(null, data.node);
+          } else if (data.node === null) {
+            /* older servers report the end of execution this way */
             wsDone = true;
-            report(100, null);
           }
-        };
-        ws.onerror = function () { /* polling fallback will handle it */ };
-      } catch (e) {
-        ws = null;
+          break;
+        case 'progress': {
+          var max = Number(data.max) || 0;
+          var value = Number(data.value) || 0;
+          if (max > 0) {
+            report(Math.max(1, Math.min(99, Math.round((value / max) * 100))), data.node);
+          }
+          break;
+        }
+        case 'execution_cached':
+          status('cached');
+          break;
+        case 'status': {
+          var info = data.status && data.status.exec_info;
+          if (handlers.onQueued) {
+            try { handlers.onQueued(info ? Number(info.queue_remaining) || 0 : 0); } catch (e) { /* ignore */ }
+          }
+          break;
+        }
+        case 'execution_error': {
+          var err = new Error(data.exception_message || data.exception_type || 'ComfyUI execution error');
+          err.details = data;
+          err.nodeId = data.node_id;
+          err.nodeType = data.node_type;
+          finish(null, err);
+          break;
+        }
+        case 'execution_success':
+          /* history may lag one tick behind - the poll loop picks it up */
+          wsDone = true;
+          report(100, null);
+          break;
+        case 'execution_interrupted':
+          finish(null, Object.assign(new Error('Cancelled.'), { cancelled: true, details: data }));
+          break;
+        default:
+          break;
       }
     }
 
+    /* Attach after creation so messages that arrived while /prompt was being
+     * queued are replayed instead of lost. */
+    socket.handler = handleWsPayload;
+    var pending = socket.queue;
+    socket.queue = [];
+    pending.forEach(handleWsPayload);
+
     var deadline = Date.now() + (handlers.timeoutMs || 30 * 60 * 1000);
-    var lastStatus = null;
-    var pollsWithoutHistory = 0;
     while (!finished) {
       if (Date.now() > deadline) {
-        finish(null, new Error('Timed out waiting for ComfyUI result.'));
+        finish(null, new Error('Timed out waiting for ComfyUI. Check the ComfyUI console.'));
         break;
       }
-      await sleep(wsDone ? 250 : 700);
+      if (handlers.shouldCancel && handlers.shouldCancel()) {
+        try { await cancelPrompt(host, promptId); } catch (e) { /* ignore */ }
+        finish(null, Object.assign(new Error('Cancelled.'), { cancelled: true }));
+        break;
+      }
+      await sleep(wsDone ? 200 : 650);
+      if (finished) break;
 
-      if (!finished) {
-        try {
-          var h = await history(host, promptId);
-          if (h && h[promptId]) {
-            var entry = h[promptId];
-            if (entry.status && entry.status.status_str === 'error') {
-              var msg = 'ComfyUI execution failed.';
-              var messages = entry.status.messages || [];
-              for (var i = 0; i < messages.length; i++) {
-                if (messages[i][0] === 'execution_error' && messages[i][1]) {
-                  msg = messages[i][1].exception_message || msg;
+      try {
+        var h = await history(host, promptId);
+        var entry = h && h[promptId];
+        if (entry) {
+          var entryStatus = entry.status || {};
+          if (entryStatus.status_str === 'error') {
+            var message = 'ComfyUI execution failed.';
+            (entryStatus.messages || []).forEach(function (m) {
+              if (m && m[0] === 'execution_error' && m[1]) {
+                message = m[1].exception_message || message;
+                if (m[1].node_id) {
+                  message += ' (node #' + m[1].node_id + ' ' + (m[1].node_type || '') + ')';
                 }
               }
-              var error = new Error(msg);
-              error.details = entry.status;
-              finish(null, error);
-            } else {
-              var imgs = imagesOf(entry);
-              if (imgs.length || (entry.status && entry.status.completed)) {
-                finish({ entry: entry, images: imgs }, null);
-              }
-            }
-          } else if (wsDone) {
-            pollsWithoutHistory++;
-            if (pollsWithoutHistory > 20) {
-              finish({ entry: null, images: [] }, null);
+            });
+            var historyError = new Error(message);
+            historyError.details = entryStatus;
+            finish(null, historyError);
+          } else {
+            var imgs = imagesOf(entry);
+            if (imgs.length || entryStatus.completed) {
+              finish({ entry: entry, images: imgs }, null);
             }
           }
-        } catch (e) {
-          lastStatus = e.message;
-          if (wsDone) {
-            pollsWithoutHistory++;
-            if (pollsWithoutHistory > 20) finish({ entry: null, images: [] }, null);
-          }
+        } else if (wsDone) {
+          if (++pollsWithoutHistory > 25) finish({ entry: null, images: [] }, null);
+        }
+      } catch (e) {
+        if (wsDone) {
+          if (++pollsWithoutHistory > 25) finish({ entry: null, images: [] }, null);
         }
       }
     }
 
-    if (ws) {
-      try { ws.close(); } catch (e) { /* ignore */ }
-      ws = null;
-    }
-
+    closeSocket(socket);
     if (finished.error) throw finished.error;
     return finished.value;
   }
@@ -329,22 +482,50 @@
   /* Full run helper used by the panel and the CLI test harness. */
   async function runPrompt(host, prompt, clientId, handlers) {
     handlers = handlers || {};
-    var queued = await queuePrompt(host, prompt, clientId);
+    var socket = openSocket(host, clientId);
+    /* Give the websocket a moment to connect before the prompt is queued so
+     * the very first execution events are not missed. */
+    try { await socket.ready; } catch (e) { /* polling still works */ }
+
+    var queued;
+    try {
+      queued = await postJson(host, '/prompt', {
+        prompt: prompt,
+        client_id: clientId || randomId()
+      });
+    } catch (e) {
+      closeSocket(socket);
+      if (e && e.nodeErrors) {
+        e.message = 'ComfyUI rejected the workflow:\n' + formatPromptError({ node_errors: e.nodeErrors });
+      }
+      throw e;
+    }
+
     if (!queued || !queued.prompt_id) {
+      closeSocket(socket);
       var err = new Error('ComfyUI did not return a prompt_id.');
       err.details = queued;
       throw err;
     }
-    var res = await waitForPrompt(host, queued.prompt_id, clientId, handlers);
-    res.promptId = queued.prompt_id;
-    res.number = queued.number;
-    return res;
+
+    var waitHandlers = {};
+    Object.keys(handlers).forEach(function (key) { waitHandlers[key] = handlers[key]; });
+    waitHandlers.socket = socket;
+    try {
+      var res = await waitForPrompt(host, queued.prompt_id, clientId, waitHandlers);
+      res.promptId = queued.prompt_id;
+      res.number = queued.number;
+      return res;
+    } finally {
+      closeSocket(socket);
+    }
   }
 
   return {
     normalizeHost: normalizeHost,
     sleep: sleep,
     randomId: randomId,
+    formatPromptError: formatPromptError,
     getJson: getJson,
     systemStats: systemStats,
     objectInfo: objectInfo,
@@ -353,6 +534,8 @@
     history: history,
     queueState: queueState,
     interrupt: interrupt,
+    cancelPrompt: cancelPrompt,
+    clearQueue: clearQueue,
     deleteQueueItems: deleteQueueItems,
     imagesOf: imagesOf,
     viewUrl: viewUrl,

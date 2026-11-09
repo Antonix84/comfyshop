@@ -27,7 +27,7 @@ function has(name) {
 }
 
 (async function main() {
-  const workflow = JSON.parse(fs.readFileSync(WORKFLOW, 'utf8'));
+  const workflow = JSON.parse(fs.readFileSync(WORKFLOW, 'utf8').replace(/^\uFEFF/, ''));
   const info = await Comfy.objectInfo(HOST);
   const model = Convert.buildModel(workflow, info);
 
@@ -57,8 +57,10 @@ function has(name) {
     }
   }
 
-  const built = Convert.buildPrompt(workflow, info, overrides);
+  const promptOptions = { outputIds: model.defaultOutputId ? [model.defaultOutputId] : null };
+  const built = Convert.buildPrompt(workflow, info, overrides, promptOptions);
   console.log('prompt nodes:', Object.keys(built.prompt).length, 'errors:', built.errors);
+  if (built.warnings && built.warnings.length) console.log('warnings:', built.warnings);
   if (built.errors.length) process.exitCode = 1;
 
   if (has('--run')) {
@@ -73,7 +75,7 @@ function has(name) {
           }
         }
       }
-      const run = Convert.buildPrompt(workflow, info, overrides);
+      const run = Convert.buildPrompt(workflow, info, overrides, promptOptions);
       if (run.errors.length) throw new Error(run.errors.join('\n'));
       const started = Date.now();
       const res = await Comfy.runPrompt(HOST, run.prompt, Comfy.randomId(), {

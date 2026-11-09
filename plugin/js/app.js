@@ -2,7 +2,7 @@
  * ComfyShop - Photoshop UXP panel.
  *
  * Plain DOM, no framework, no build step. The panel:
- *   - lists ComfyUI workflow JSON files from F:\AI\ComfyUI\workflows
+ *   - lists ComfyUI workflow JSON files from the connected server
  *   - shows every node whose title starts with "#" as an editable parameter
  *   - uploads the current Photoshop document (or layer/selection) to ComfyUI
  *   - runs the workflow 1/2/5/10 times and inserts each result as a new layer
@@ -641,6 +641,7 @@
       renderParams();
       setStatus('ready', 'ok');
       log('Loaded ' + name + ' (' + state.model.nodeCount + ' nodes, ' + state.model.exposed.length + ' parameters)');
+      (state.model.warnings || []).forEach(function (warning) { log(warning, 'warn'); });
       debugLog('selectWorkflow: ' + name + ' exposed=' + state.model.exposed.length +
         ' images=' + state.model.loadImages.length + ' outputs=' + state.model.outputs.length +
         ' errors=' + (state.model.errors || []).join('|'));
@@ -1045,7 +1046,13 @@
   function chooseOutputImages(images, outputId) {
     if (!images || !images.length) return [];
     var filtered = images.filter(function (img) { return String(img.nodeId) === String(outputId); });
-    return filtered.length ? filtered : images;
+    if (filtered.length) images = filtered;
+    /* gifs/videos can be reported by custom save nodes; Photoshop can only
+     * insert still images, so prefer those when both are returned. */
+    var still = images.filter(function (img) {
+      return img.key === 'images' || !img.key || /\.(png|jpe?g|webp|tiff?|bmp)$/i.test(String(img.filename));
+    });
+    return still.length ? still : images;
   }
 
   function pngSize(arrayBuffer) {
@@ -1095,14 +1102,18 @@
       });
     }
 
-    var built = Convert.buildPrompt(state.workflow, state.objectInfo, overrides);
+    var built = Convert.buildPrompt(state.workflow, state.objectInfo, overrides, {
+      outputIds: state.outputId ? [state.outputId] : null
+    });
     if (built.errors.length) throw new Error(built.errors.join('\n'));
+    (built.warnings || []).forEach(function (warning) { log(warning, 'warn'); });
 
     setStatus('queued ' + (index + 1) + '/' + total, 'busy');
     log('Queueing prompt ' + (index + 1) + '/' + total + ' (' + Object.keys(built.prompt).length + ' nodes)...');
 
     var result = await Comfy.runPrompt(host, built.prompt, Comfy.randomId(), {
       timeoutMs: 30 * 60 * 1000,
+      shouldCancel: function () { return state.cancelRequested; },
       onProgress: function (pct) {
         if (pct !== null && pct !== undefined) {
           setProgress(((index + pct / 100) / total) * 100);
@@ -1119,42 +1130,55 @@
     if (!images.length) throw new Error('ComfyUI finished but returned no images.');
     debugLog('result images: ' + images.map(function (i) { return i.nodeId + ':' + i.filename; }).join(', '));
 
-    var image = images[0];
-    log('Downloading ' + image.filename + '...');
-    var arrayBuffer = await Comfy.fetchImage(host, image);
-
-    setStatus('inserting layer ' + (index + 1) + '/' + total, 'busy');
-    var temp = await PS.getTempFile('comfyshop_result_' + Date.now() + '.png');
-    await PS.writeEntryBytes(temp, arrayBuffer);
-    var size = pngSize(arrayBuffer);
-    debugLog('inserting ' + image.filename + ' ' + size.width + 'x' + size.height);
-
     var baseName = String(state.workflowName || 'ComfyShop').replace(/\.json$/i, '');
     if (total > 1) baseName += ' ' + (index + 1);
-    var origin = prep.exportResult ? prep.exportResult.origin : { x: 0, y: 0 };
-    var inserted = await PS.insertFile(temp, {
-      name: baseName,
-      origin: origin,
-      width: size.width,
-      height: size.height
-    });
-    await PS.deleteEntry(temp);
 
     var seconds = ((Date.now() - runStarted) / 1000).toFixed(1);
     var time = new Date().toLocaleTimeString().replace(/:/g, '-');
-    var layerName = baseName + ' ' + time + ' ' + seconds + 's';
-    try {
-      await PS.renameLayer(inserted.layerId, layerName);
-      inserted.layerName = layerName;
-    } catch (e) {
-      debugLog('rename layer failed: ' + (e && (e.message || e)));
-    }
-    debugLog('inserted layer ' + inserted.layerId + ' "' + inserted.layerName + '" bounds=' + JSON.stringify(inserted.bounds));
+    var runName = baseName + ' ' + time + ' ' + seconds + 's';
+    var origin = prep.exportResult ? prep.exportResult.origin : { x: 0, y: 0 };
+    var targetWidth = prep.exportResult && prep.exportResult.width
+      ? prep.exportResult.width
+      : (prep.exportResult ? prep.exportResult.docWidth : 0);
+    var targetHeight = prep.exportResult && prep.exportResult.height
+      ? prep.exportResult.height
+      : (prep.exportResult ? prep.exportResult.docHeight : 0);
 
-    showPreview(arrayBuffer, inserted.layerName);
-    state.lastResult = { layerName: inserted.layerName, image: image, index: index + 1 };
-    log('Inserted layer "' + inserted.layerName + '".', 'ok');
-    return inserted;
+    var lastInserted = null;
+    var lastBuffer = null;
+
+    for (var n = 0; n < images.length; n++) {
+      var image = images[n];
+      log('Downloading ' + image.filename + '...');
+      var arrayBuffer = await Comfy.fetchImage(host, image);
+      var size = pngSize(arrayBuffer);
+      debugLog('inserting ' + image.filename + ' ' + size.width + 'x' + size.height);
+
+      setStatus('inserting layer ' + (index + 1) + '/' + total +
+        (images.length > 1 ? ' (' + (n + 1) + '/' + images.length + ')' : ''), 'busy');
+
+      var temp = await PS.getTempFile('comfyshop_result_' + Date.now() + '_' + n + '.png');
+      try {
+        await PS.writeEntryBytes(temp, arrayBuffer);
+        lastInserted = await PS.insertFile(temp, {
+          name: runName + (images.length > 1 ? ' ' + (n + 1) : ''),
+          origin: origin,
+          width: targetWidth || size.width,
+          height: targetHeight || size.height
+        });
+        lastBuffer = arrayBuffer;
+      } finally {
+        try { await PS.deleteEntry(temp); } catch (e) { /* ignore */ }
+      }
+
+      debugLog('inserted layer ' + lastInserted.layerId + ' "' + lastInserted.layerName +
+        '" bounds=' + JSON.stringify(lastInserted.bounds));
+      state.lastResult = { layerName: lastInserted.layerName, image: image, index: index + 1 };
+      log('Inserted layer "' + lastInserted.layerName + '".', 'ok');
+    }
+
+    if (lastBuffer) showPreview(lastBuffer, lastInserted.layerName);
+    return lastInserted;
   }
 
   async function generateBatch(count) {

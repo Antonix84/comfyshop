@@ -6,11 +6,14 @@ Photoshop UXP panel for running ComfyUI workflows and inserting the result as a 
 
 - Connect/disconnect to a local or remote ComfyUI server.
 - Workflow list is read from the ComfyUI server (`/userdata?dir=workflows`, i.e. ComfyUI's `user/default/workflows`).
-- Nodes whose titles start with `#` become editable parameters.
-- `x1`, `x2`, `x5`, `x10` run the workflow one or more times. Every result is inserted as a separate layer.
+- Nodes whose titles start with `#` become editable parameters. SD-PPP style `sdppp_widgetable_title` markers work too.
+- UI-format workflows, API-format prompts, and workflows with ComfyUI subgraphs are accepted.
+- `x1`, `x2`, `x5`, `x10` run the workflow one or more times. Every returned image is inserted as a separate layer.
 - `Stop` interrupts the current generation.
 - Result layers are named `<workflow> <time> <duration>`.
 - Batch runs randomize seed values (unless the per-seed `each` checkbox is disabled).
+- Layer and selection exports keep transparency; results are scaled and placed back into the exported area.
+- Only the part of the graph that feeds the selected output is sent to ComfyUI, so unrelated nodes with missing custom packs do not block a run.
 
 ## Requirements
 
@@ -51,7 +54,7 @@ The workflow list comes from the ComfyUI server, so the panel works with a remot
 The plugin source is in `plugin/`. The install script copies it to:
 
 ```
-%APPDATA%\Adobe\UXP\Plugins\External\com.comfyshop.panel_1.0.0
+%APPDATA%\Adobe\UXP\Plugins\External\com.comfyshop.panel_<version>
 ```
 
 and registers it in:
@@ -71,8 +74,8 @@ Set `COMFY_HOST`, `COMFY_WORKFLOW`, and `COMFY_IMAGE` environment variables to t
 
 ## Notes and limitations
 
-- Workflows using ComfyUI subgraphs are not supported yet.
-- Missing custom nodes are reported as workflow errors.
+- Workflows with ComfyUI subgraphs are flattened automatically. If a workflow cannot be inlined, export it with `Export (API)` and use that JSON instead.
+- Missing custom nodes are reported only when the selected output actually needs them; unused unknown nodes are skipped.
 - Both legacy `widgets_values` and newer `widgets_values_named` are supported, including the newer `COMBO` input format used by nodes such as `ImageScaleToTotalPixels`.
 - The panel is inspired by the concept of SD-PPP but is an independent implementation.
 
