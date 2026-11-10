@@ -4,8 +4,12 @@
  * Plain DOM, no framework, no build step. The panel:
  *   - lists ComfyUI workflow JSON files from the connected server
  *   - shows every node whose title starts with "#" as an editable parameter
- *   - uploads the current Photoshop document (or layer/selection) to ComfyUI
- *   - runs the workflow 1/2/5/10 times and inserts each result as a new layer
+ *     (inside such a node only widgets marked with "#" are shown when the
+ *     workflow uses widget marks)
+ *   - shows one Send all / Send layer block with a preview per "#" image input
+ *   - captures the active Photoshop document or layer on Send
+ *   - runs the workflow 1/2/5 times and inserts each result as a new layer
+ *   - connects on startup and keeps reconnecting after a connection loss
  */
 (function (root, factory) {
   if (typeof document !== 'undefined' && root) { root.CSApp = factory(); return; }
@@ -26,14 +30,30 @@
   var SETTINGS_KEY = 'comfyshop.settings.v4';
   var WORKFLOW_STATE_KEY = 'comfyshop.workflows.v4';
 
+  /* Text fields (prompt etc.) used to stop at 256 characters. */
+  var TEXT_MAX_LENGTH = 768;
+
+  /* Connection watchdog: while connected check every 10 s, while offline
+   * retry every 7 s. One small /system_stats request per tick is cheap. */
+  var WATCH_INTERVAL_MS = 10000;
+  var RECONNECT_INTERVAL_MS = 7000;
+
+  /* view URL -> data URL, used only if UXP cannot render the remote image. */
+  var previewCache = {};
+  /* node id -> local data URL shown while an outgoing image is uploading. */
+  var sourcePreviews = {};
+  var docWatchTimer = null;
+
   var settings = {
     host: DEFAULT_HOST,
-    sourceKind: 'document',
     lastWorkflow: ''
   };
 
-  // key -> {values, usePs, randomSeeds, outputId}
+  // key -> {values, randomSeeds, outputId}
   var workflowStates = {};
+  /* Sent images are intentionally session-only: a fresh Photoshop start
+   * shows empty source previews again. */
+  var sessionSentImages = {};
 
   var state = {
     workflows: [],
@@ -44,12 +64,15 @@
     model: null,
     outputId: null,
     values: {},
-    usePs: {},
     randomSeeds: {},
+    sentImages: {},
     connected: false,
     connecting: false,
     running: false,
+    sending: false,
     cancelRequested: false,
+    autoConnect: true,
+    watchTimer: null,
     lastResult: null,
     panelRoot: null,
     batch: { total: 0, done: 0 },
@@ -142,9 +165,9 @@
 
   function saveWorkflowState() {
     if (!state.workflowName) return;
+    sessionSentImages[state.workflowName] = state.sentImages;
     workflowStates[state.workflowName] = {
       values: state.values,
-      usePs: state.usePs,
       randomSeeds: state.randomSeeds,
       outputId: state.outputId
     };
@@ -154,7 +177,7 @@
   function applyWorkflowState(name) {
     var s = workflowStates[name] || {};
     state.values = s.values || {};
-    state.usePs = s.usePs || {};
+    state.sentImages = sessionSentImages[name] || {};
     state.randomSeeds = s.randomSeeds || {};
     state.outputId = s.outputId || null;
   }
@@ -166,20 +189,12 @@
     try {
       var cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (cfg.host) settings.host = String(cfg.host);
-      if (cfg.sourceKind) settings.sourceKind = String(cfg.sourceKind);
       if (cfg.workflow) settings.lastWorkflow = String(cfg.workflow);
       if (cfg.values && typeof cfg.values === 'object') {
         var wf = settings.lastWorkflow;
         if (wf) {
           workflowStates[wf] = workflowStates[wf] || {};
           workflowStates[wf].values = cfg.values;
-        }
-      }
-      if (cfg.usePs && typeof cfg.usePs === 'object') {
-        var wf2 = settings.lastWorkflow;
-        if (wf2) {
-          workflowStates[wf2] = workflowStates[wf2] || {};
-          workflowStates[wf2].usePs = cfg.usePs;
         }
       }
       debugLog('external config: workflow=' + settings.lastWorkflow);
@@ -215,6 +230,11 @@
       try { msg += '\n' + JSON.stringify(err.details.node_errors, null, 2).slice(0, 2000); } catch (e) { /* ignore */ }
     }
     return msg;
+  }
+
+  function isNetworkError(err) {
+    var msg = String((err && (err.message || err)) || '');
+    return /failed to fetch|network error|econnrefused|econnreset|connection (lost|refused|closed)|websocket|not connected/i.test(msg);
   }
 
   function setDisabled(node, disabled) {
@@ -387,14 +407,15 @@
     var settingsPanel = append(root, el('div', 'cs-settings'));
     settingsPanel.appendChild(buildSettings(hostInput, connectBtn, disconnectBtn));
 
-    /* run controls: Stop on the left, then x1/x2/x5/x10 */
-    var runRow = append(root, el('div', 'cs-run-row cs-run-top'));
-    var stopBtn = append(runRow, el('button', 'danger small', 'Stop'));
+    /* run controls: two buttons per row, x10 is gone */
+    var runTop = append(root, el('div', 'cs-run-top'));
+    var runRow1 = append(runTop, el('div', 'cs-run-row'));
+    var stopBtn = append(runRow1, el('button', 'danger small', 'Stop'));
     stopBtn.disabled = true;
-    var run1 = append(runRow, el('button', 'primary', 'x1'));
-    var run2 = append(runRow, el('button', 'primary', 'x2'));
-    var run5 = append(runRow, el('button', 'primary', 'x5'));
-    var run10 = append(runRow, el('button', 'primary', 'x10'));
+    var run1 = append(runRow1, el('button', 'primary', 'x1'));
+    var runRow2 = append(runTop, el('div', 'cs-run-row'));
+    var run2 = append(runRow2, el('button', 'primary', 'x2'));
+    var run5 = append(runRow2, el('button', 'primary', 'x5'));
 
     var toolbar = append(root, el('div', 'cs-section'));
 
@@ -402,34 +423,17 @@
     var wfHead = append(toolbar, el('div', 'cs-row wf-head'));
     append(wfHead, el('span', 'cs-label', 'Workflow'));
     var reloadBtn = append(wfHead, el('button', 'small', 'Reload'));
+    reloadBtn.title = 'Reload the workflow and reset all parameters to its stored values';
     var wfRow = append(toolbar, el('div', 'cs-row'));
     var wfDropdown = append(wfRow, createDropdown({
       onChange: function (name) { selectWorkflow(name); }
     }));
 
-    /* source */
-    var srcRow = append(toolbar, el('div', 'cs-row'));
-    append(srcRow, el('span', 'cs-label', 'Send'));
-    var srcDropdown = append(srcRow, createDropdown({
-      options: [
-        { value: 'document', label: 'Document (flattened)' },
-        { value: 'layer', label: 'Active layer' },
-        { value: 'selection', label: 'Selection area' }
-      ],
-      value: settings.sourceKind,
-      onChange: function (kind) {
-        settings.sourceKind = kind;
-        saveSettings();
-        updateDocHint();
-      }
-    }));
     var docHint = append(toolbar, el('div', 'cs-hint'));
 
     /* body */
     var body = append(root, el('div', 'cs-body'));
-    var preview = append(body, el('div', 'cs-preview'));
-    var previewImg = append(preview, el('img'));
-    var previewCaption = append(preview, el('div', 'cs-preview-caption'));
+    var sourcesHost = append(body, el('div', 'cs-sources'));
     var paramsHost = append(body, el('div', 'cs-params'));
 
     /* footer: progress + log only */
@@ -449,17 +453,13 @@
       disconnectBtn: disconnectBtn,
       wfDropdown: wfDropdown,
       reloadBtn: reloadBtn,
-      srcDropdown: srcDropdown,
       docHint: docHint,
+      sourcesHost: sourcesHost,
       body: body,
-      preview: preview,
-      previewImg: previewImg,
-      previewCaption: previewCaption,
       paramsHost: paramsHost,
       run1: run1,
       run2: run2,
       run5: run5,
-      run10: run10,
       stopBtn: stopBtn,
       progressFill: progressFill,
       logBox: logBox
@@ -496,12 +496,11 @@
 
     e.connectBtn.addEventListener('click', function () { connect(); });
     e.disconnectBtn.addEventListener('click', function () { disconnect(); });
-    e.reloadBtn.addEventListener('click', function () { refreshWorkflowList(); });
+    e.reloadBtn.addEventListener('click', function () { resetWorkflow(); });
 
     e.run1.addEventListener('click', function () { generateBatch(1); });
     e.run2.addEventListener('click', function () { generateBatch(2); });
     e.run5.addEventListener('click', function () { generateBatch(5); });
-    e.run10.addEventListener('click', function () { generateBatch(10); });
     e.stopBtn.addEventListener('click', function () { stopRun(); });
   }
 
@@ -538,17 +537,16 @@
   function updateConnectionUI() {
     var e = state.els;
     var offline = !state.connected;
-    setDisabled(e.connectBtn, state.connected || state.connecting || state.running);
-    setDisabled(e.disconnectBtn, !state.connected || state.running);
-    setDisabled(e.hostInput, state.running);
-    setDisabled(e.wfDropdown, !state.connected || state.running);
-    setDisabled(e.reloadBtn, !state.connected || state.running);
-    setDisabled(e.srcDropdown, state.running);
-    setDisabled(e.run1, offline || state.running || !state.model);
-    setDisabled(e.run2, offline || state.running || !state.model);
-    setDisabled(e.run5, offline || state.running || !state.model);
-    setDisabled(e.run10, offline || state.running || !state.model);
+    setDisabled(e.connectBtn, state.connected || state.connecting || state.running || state.sending);
+    setDisabled(e.disconnectBtn, state.running || state.connecting || state.sending || (!state.connected && !state.autoConnect));
+    setDisabled(e.hostInput, state.running || state.sending);
+    setDisabled(e.wfDropdown, !state.connected || state.running || state.sending);
+    setDisabled(e.reloadBtn, !state.connected || state.running || state.sending);
+    setDisabled(e.run1, offline || state.running || state.sending || !state.model);
+    setDisabled(e.run2, offline || state.running || state.sending || !state.model);
+    setDisabled(e.run5, offline || state.running || state.sending || !state.model);
     setDisabled(e.stopBtn, !state.running);
+    renderSourceBlocks();
   }
 
   /* ------------------------------------------------------------------ */
@@ -570,6 +568,23 @@
   function pickDefaultWorkflow(files) {
     if (settings.lastWorkflow && files.indexOf(settings.lastWorkflow) >= 0) return settings.lastWorkflow;
     return files[0] || '';
+  }
+
+  async function resetWorkflow() {
+    var name = state.workflowName || settings.lastWorkflow;
+    if (name) {
+      /* Reload means "forget my edits and use the values stored in the
+       * workflow JSON again". Uploaded photo references are forgotten too. */
+      delete workflowStates[name];
+      delete sessionSentImages[name];
+      STORAGE.set(WORKFLOW_STATE_KEY, workflowStates);
+      state.values = {};
+      state.randomSeeds = {};
+      state.sentImages = {};
+      state.outputId = null;
+      log('Reloading "' + name + '" - parameters reset to workflow values.');
+    }
+    await refreshWorkflowList();
   }
 
   async function refreshWorkflowList() {
@@ -606,6 +621,7 @@
 
   async function selectWorkflow(name) {
     if (!name) return;
+    if (state.workflowName) sessionSentImages[state.workflowName] = state.sentImages;
     state.workflowName = name;
     settings.lastWorkflow = name;
     saveSettings();
@@ -637,7 +653,6 @@
       if (!state.outputId || !state.model.outputs.some(function (o) { return String(o.id) === String(state.outputId); })) {
         state.outputId = state.model.defaultOutputId;
       }
-      initImageFlags();
       renderParams();
       setStatus('ready', 'ok');
       log('Loaded ' + name + ' (' + state.model.nodeCount + ' nodes, ' + state.model.exposed.length + ' parameters)');
@@ -656,17 +671,6 @@
     updateDocHint();
   }
 
-  function initImageFlags() {
-    var imgs = state.model.loadImages || [];
-    for (var i = 0; i < imgs.length; i++) {
-      var id = String(imgs[i].id);
-      if (!Object.prototype.hasOwnProperty.call(state.usePs, id)) {
-        state.usePs[id] = imgs.length === 1 ? true : i === 0;
-      }
-    }
-    saveWorkflowState();
-  }
-
   async function ensureObjectInfo() {
     var host = Comfy.normalizeHost(settings.host);
     if (state.objectInfo && state.objectInfoHost === host) return state.objectInfo;
@@ -682,15 +686,16 @@
   /* connection                                                         */
   /* ------------------------------------------------------------------ */
 
-  async function connect() {
+  async function connect(silent) {
     if (state.connected || state.connecting || state.running) return;
     state.connecting = true;
+    state.autoConnect = true;
     updateConnectionUI();
     settings.host = (state.els.hostInput.value || '').trim() || DEFAULT_HOST;
     saveSettings();
 
     try {
-      setStatus('connecting', 'busy');
+      setStatus(silent ? 'reconnecting' : 'connecting', 'busy');
       debugLog('connect: ' + settings.host);
       var stats = await Comfy.systemStats(settings.host);
       var info = await Comfy.objectInfo(settings.host);
@@ -699,7 +704,8 @@
       state.connected = true;
       var version = (stats.system && stats.system.comfyui_version) || '?';
       setStatus('connected ' + version, 'ok');
-      log('Connected to ' + Comfy.normalizeHost(settings.host) + ' (ComfyUI ' + version + ')');
+      log((silent ? 'Reconnected to ' : 'Connected to ') +
+        Comfy.normalizeHost(settings.host) + ' (ComfyUI ' + version + ')');
       debugLog('connect ok version=' + version + ' nodes=' + Object.keys(info).length);
       try { state.els.settingsPanel.classList.remove('visible'); } catch (e) { /* ignore */ }
       await refreshWorkflowList();
@@ -708,25 +714,99 @@
       state.objectInfo = null;
       state.objectInfoHost = '';
       state.model = null;
-      setStatus('offline', 'bad');
-      log('Cannot reach ComfyUI: ' + friendlyError(e), 'err');
-      debugLog('connect failed: ' + (e && (e.stack || e.message || e)));
+      if (silent) {
+        /* Automatic retries must not flood the log. */
+        setStatus('reconnecting', 'busy');
+        debugLog('connect retry failed: ' + (e && (e.stack || e.message || e)));
+      } else {
+        setStatus('offline', 'bad');
+        log('Cannot reach ComfyUI: ' + friendlyError(e), 'err');
+        debugLog('connect failed: ' + (e && (e.stack || e.message || e)));
+      }
       renderParams();
     } finally {
       state.connecting = false;
       updateConnectionUI();
       updateDocHint();
+      scheduleWatchdog(state.connected ? WATCH_INTERVAL_MS : RECONNECT_INTERVAL_MS);
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* connection watchdog                                                */
+  /* ------------------------------------------------------------------ */
+
+  function stopWatchdog() {
+    if (state.watchTimer) {
+      clearTimeout(state.watchTimer);
+      state.watchTimer = null;
+    }
+  }
+
+  function scheduleWatchdog(delay) {
+    stopWatchdog();
+    if (!state.autoConnect) return;
+    state.watchTimer = setTimeout(function () {
+      state.watchTimer = null;
+      watchdogTick();
+    }, Math.max(1000, delay || WATCH_INTERVAL_MS));
+  }
+
+  function startWatchdog() {
+    state.autoConnect = true;
+    scheduleWatchdog(state.connected ? WATCH_INTERVAL_MS : RECONNECT_INTERVAL_MS);
+  }
+
+  async function watchdogTick() {
+    if (!state.autoConnect) return;
+
+    /* Do not fight a running generation; health check afterwards. */
+    if (state.running) {
+      scheduleWatchdog(WATCH_INTERVAL_MS);
+      return;
+    }
+
+    if (!state.connected) {
+      if (!state.connecting) await connect(true);
+      scheduleWatchdog(state.connected ? WATCH_INTERVAL_MS : RECONNECT_INTERVAL_MS);
+      return;
+    }
+
+    try {
+      /* One tiny request per tick - negligible CPU load. */
+      await Comfy.systemStats(settings.host);
+      scheduleWatchdog(WATCH_INTERVAL_MS);
+    } catch (e) {
+      debugLog('watchdog: connection lost: ' + (e && (e.message || e)));
+      markOffline();
+      scheduleWatchdog(RECONNECT_INTERVAL_MS);
+    }
+  }
+
+  function markOffline() {
+    if (!state.connected) return;
+    state.connected = false;
+    state.objectInfo = null;
+    state.objectInfoHost = '';
+    state.model = null;
+    setStatus('reconnecting', 'busy');
+    log('Connection lost - retrying every ' + Math.round(RECONNECT_INTERVAL_MS / 1000) + 's.', 'warn');
+    debugLog('connection lost');
+    renderParams();
+    updateConnectionUI();
+    updateDocHint();
   }
 
   function disconnect() {
     if (state.connecting) return;
+    state.autoConnect = false;
+    stopWatchdog();
     state.connected = false;
     state.objectInfo = null;
     state.objectInfoHost = '';
     state.model = null;
     setStatus('offline', 'bad');
-    log('Disconnected.');
+    log('Disconnected. Auto-reconnect is off until you press Connect.');
     debugLog('disconnect');
     renderParams();
     updateConnectionUI();
@@ -740,15 +820,13 @@
     var hint = state.els.docHint;
     if (!hint) return;
     var info = null;
-    try { info = PS.documentInfo(); } catch (e) { info = null; }
-    if (!info) {
-      hint.textContent = 'No open document - generation will not run.';
-      hint.className = 'cs-hint cs-error';
-      return;
-    }
-    var sel = info.selection ? ', selection ' + info.selection.width + 'x' + info.selection.height : '';
-    hint.className = 'cs-hint';
-    hint.textContent = info.name + ' (' + info.width + 'x' + info.height + ')' + sel;
+    try { info = PS.documentInfoLight ? PS.documentInfoLight() : PS.documentInfo(); } catch (e) { info = null; }
+    var text = info
+      ? info.name + ' (' + info.width + 'x' + info.height + ')'
+      : 'No open document - generation will not run.';
+    var cls = info ? 'cs-hint' : 'cs-hint cs-error';
+    if (hint.textContent !== text) hint.textContent = text;
+    if (hint.className !== cls) hint.className = cls;
   }
 
   /* ------------------------------------------------------------------ */
@@ -759,9 +837,12 @@
     var host = state.els.paramsHost;
     if (!host) return;
     clear(host);
+    renderSourceBlocks();
 
     if (!state.connected) {
-      append(host, el('div', 'cs-hint', 'Not connected. Click Connect to load the workflow and its parameters.'));
+      append(host, el('div', 'cs-hint', state.autoConnect
+        ? 'Not connected - trying to reconnect automatically...'
+        : 'Not connected. Click Connect to load the workflow and its parameters.'));
       return;
     }
     if (!state.model) {
@@ -778,25 +859,31 @@
     }
 
     var exposed = state.model.exposed || [];
-    var exposedIds = {};
-    exposed.forEach(function (n) { exposedIds[String(n.id)] = true; });
-
     if (!exposed.length) {
       append(host, el('div', 'cs-hint',
         'No parameters: rename nodes in ComfyUI so their titles start with "#" to expose them here.'));
     }
 
-    exposed.forEach(function (node) { host.appendChild(renderNodeCard(node)); });
-
-    var extraImages = (state.model.loadImages || []).filter(function (img) {
-      return !exposedIds[String(img.id)];
+    var renderedCards = 0;
+    exposed.forEach(function (node) {
+      /* LoadImage-only nodes are represented by their source block above. */
+      var hasWidgets = (node.widgets || []).some(function (w) {
+        return !(node.isLoadImage && w.name === 'image');
+      });
+      if (!hasWidgets) return;
+      /* In strict mode only marked widgets are shown; skip empty cards. */
+      if (node.strictMarks && (!node.widgets || !node.widgets.length)) return;
+      host.appendChild(renderNodeCard(node));
+      renderedCards++;
     });
-    if (extraImages.length) {
-      var card = append(host, el('div', 'cs-card'));
-      var head = append(card, el('div', 'cs-card-head'));
-      append(head, el('div', 'cs-card-title', 'Image inputs'));
-      var body = append(card, el('div', 'cs-card-body'));
-      extraImages.forEach(function (img) { body.appendChild(renderImageInput(img, false)); });
+    var anyParamWidgets = exposed.some(function (node) {
+      return (node.widgets || []).some(function (w) {
+        return !(node.isLoadImage && w.name === 'image');
+      });
+    });
+    if (anyParamWidgets && !renderedCards) {
+      append(host, el('div', 'cs-hint',
+        'No parameters are marked with "#". Rename widget labels in ComfyUI, e.g. "#megapixels".'));
     }
 
     if (state.model.outputs && state.model.outputs.length > 1) {
@@ -828,18 +915,6 @@
     for (var i = 0; i < widgets.length; i++) {
       if (node.isLoadImage && widgets[i].name === 'image') continue;
       body.appendChild(renderWidget(node, widgets[i]));
-      rendered++;
-    }
-
-    if (node.isLoadImage) {
-      var imageWidget = null;
-      for (var j = 0; j < widgets.length; j++) if (widgets[j].name === 'image') imageWidget = widgets[j];
-      body.appendChild(renderImageInput({
-        id: node.id,
-        title: node.title,
-        imageValue: pickWidget(node, 'image'),
-        widgets: imageWidget ? [imageWidget] : []
-      }, true));
       rendered++;
     }
 
@@ -876,7 +951,8 @@
   function renderWidget(node, widget) {
     var wrap = el('div', 'cs-field');
     var head = append(wrap, el('div', 'cs-field-head'));
-    var nameEl = append(head, el('div', 'cs-field-name', widget.name));
+    var shownName = widget.displayName || widget.label || widget.name;
+    var nameEl = append(head, el('div', 'cs-field-name', shownName));
     nameEl.title = widget.name;
     var value = getValue(node.id, widget);
     var kind = widget.kind;
@@ -921,7 +997,8 @@
       wrap.className = 'cs-field cs-field-block';
       var ta = append(wrap, el('textarea'));
       ta.value = value === undefined ? '' : String(value);
-      ta.rows = 3;
+      ta.rows = 8;
+      limitTextInput(ta, ta.value.length);
       ta.addEventListener('change', function () { setValue(node.id, widget, ta.value); });
       return wrap;
     }
@@ -949,58 +1026,183 @@
     } else {
       input.type = 'text';
       input.value = value === undefined ? '' : String(value);
+      limitTextInput(input, input.value.length);
       input.addEventListener('change', function () { setValue(node.id, widget, input.value); });
     }
     return wrap;
   }
 
-  function renderImageInput(img, insideCard) {
-    var wrap = el('div', 'cs-field cs-field-block');
-    var head = append(wrap, el('div', 'cs-field-head'));
-    append(head, el('div', 'cs-field-name', insideCard ? 'image' : (img.title || ('LoadImage #' + img.id))));
+  /* Raise the character limit and make sure UXP does not fall back to its
+   * small default for prompt/text fields. Longer values that are already
+   * stored in the workflow are preserved. */
+  function limitTextInput(node, currentLength) {
+    var limit = Math.max(TEXT_MAX_LENGTH, Number(currentLength) || 0);
+    try { node.maxLength = limit; } catch (e) { /* ignore */ }
+    try { node.setAttribute('maxlength', String(limit)); } catch (e) { /* ignore */ }
+  }
 
-    var toggleWrap = el('label', 'cs-check');
-    var toggle = append(toggleWrap, el('input'));
-    toggle.type = 'checkbox';
-    toggle.checked = state.usePs[String(img.id)] !== false;
-    if (!Object.prototype.hasOwnProperty.call(state.usePs, String(img.id))) toggle.checked = true;
-    append(toggleWrap, document.createTextNode('take from Photoshop'));
-    append(head, toggleWrap);
+  function imageMime(name) {
+    if (/\.jpe?g$/i.test(String(name))) return 'image/jpeg';
+    if (/\.webp$/i.test(String(name))) return 'image/webp';
+    if (/\.gif$/i.test(String(name))) return 'image/gif';
+    if (/\.bmp$/i.test(String(name))) return 'image/bmp';
+    if (/\.tiff?$/i.test(String(name))) return 'image/tiff';
+    return 'image/png';
+  }
 
-    var note = append(wrap, el('div', 'cs-hint'));
-    var fileRow = null;
-
-    function refreshNote() {
-      if (toggle.checked) {
-        note.textContent = 'Uses the "' + settings.sourceKind + '" from the active document.';
-        if (fileRow) fileRow.style.display = 'none';
-      } else {
-        note.textContent = 'Uses the image set in the workflow.';
-        if (fileRow) fileRow.style.display = '';
-      }
+  function arrayBufferToDataUrl(arrayBuffer, mime) {
+    var bytes = new Uint8Array(arrayBuffer);
+    var binary = '';
+    var chunk = 0x8000;
+    for (var i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
     }
+    return 'data:' + (mime || 'image/png') + ';base64,' + btoa(binary);
+  }
 
-    if (img.widgets && img.widgets.length) {
-      fileRow = el('div', 'cs-row');
-      var widget = null;
-      for (var i = 0; i < img.widgets.length; i++) if (img.widgets[i].name === 'image') widget = img.widgets[i];
-      if (widget) {
-        append(fileRow, createDropdown({
-          options: widget.values || [],
-          value: getValue(img.id, widget),
-          onChange: function (v) { setValue(img.id, widget, v); }
-        }));
-        append(wrap, fileRow);
-      }
+  /* Some UXP builds refuse http(s) URLs in <img>. Fetch the thumbnail as a
+   * data URL only when the direct URL failed. */
+  async function loadPreviewFallback(imgEl, ref) {
+    var url = Comfy.viewUrl(settings.host, ref);
+    if (previewCache[url]) {
+      imgEl.src = previewCache[url];
+      return;
     }
+    try {
+      var buffer = await Comfy.fetchImage(settings.host, ref);
+      var data = arrayBufferToDataUrl(buffer, imageMime(ref.filename));
+      previewCache[url] = data;
+      imgEl.src = data;
+    } catch (e) {
+      try { imgEl.style.visibility = 'hidden'; } catch (e2) { /* ignore */ }
+    }
+  }
 
-    toggle.addEventListener('change', function () {
-      state.usePs[String(img.id)] = toggle.checked;
-      saveWorkflowState();
-      refreshNote();
+  /* Which image inputs get their own Send block?
+   * The first input always gets one. Additional inputs appear when their
+   * node is marked with "#" (exposed) or the image widget itself is marked. */
+  function sourceImages() {
+    var imgs = (state.model && state.model.loadImages) || [];
+    return imgs.filter(function (img, index) {
+      if (index === 0) return true;
+      if (img.exposed) return true;
+      var marks = img.markedNames || [];
+      return marks.indexOf('image') >= 0 || marks.indexOf('mask') >= 0;
     });
-    refreshNote();
-    return wrap;
+  }
+
+  function sentImageRef(sent) {
+    if (!sent || !sent.name) return null;
+    return { filename: sent.name, subfolder: sent.subfolder || '', type: sent.type || 'input' };
+  }
+
+  function renderSourceBlocks() {
+    var host = state.els.sourcesHost;
+    if (!host) return;
+    clear(host);
+    if (!state.connected || !state.model) return;
+    var imgs = sourceImages();
+    if (!imgs.length) return;
+    for (var i = 0; i < imgs.length; i++) {
+      host.appendChild(renderSourceBlock(imgs[i], i + 1, imgs.length > 1));
+    }
+  }
+
+  function renderSourceBlock(img, order, showOrder) {
+    var id = String(img.id);
+    var sent = state.sentImages[id];
+    var card = el('div', 'cs-card cs-source-card');
+    var head = append(card, el('div', 'cs-card-head'));
+    var title = (showOrder ? 'Photo ' + order + ': ' : '') + (img.title || ('Load Image #' + img.id));
+    append(head, el('div', 'cs-card-title', title));
+    var body = append(card, el('div', 'cs-card-body'));
+
+    var row = append(body, el('div', 'cs-run-row cs-send-row cs-source-actions'));
+    var allBtn = append(row, el('button', 'small', 'Send all'));
+    allBtn.title = 'Send the flattened active document';
+    var layerBtn = append(row, el('button', 'small', 'Send layer'));
+    layerBtn.title = 'Send the active layer';
+    setDisabled(allBtn, state.running || state.connecting || state.sending);
+    setDisabled(layerBtn, state.running || state.connecting || state.sending);
+    if (sent && sent.kind === 'document') allBtn.classList.add('active');
+    if (sent && sent.kind === 'layer') layerBtn.classList.add('active');
+    allBtn.addEventListener('click', function () { sendImageSource(img, 'document'); });
+    layerBtn.addEventListener('click', function () { sendImageSource(img, 'layer'); });
+
+    var preview = append(body, el('div', 'cs-source-preview'));
+    var previewImg = append(preview, el('img'));
+    var caption = append(body, el('div', 'cs-hint'));
+    var pending = sourcePreviews[id];
+    if (pending) {
+      previewImg.style.visibility = 'visible';
+      previewImg.src = pending;
+      caption.textContent = 'Sending...';
+      return card;
+    }
+    var ref = sentImageRef(sent);
+    if (ref) {
+      previewImg.onload = function () { previewImg.style.visibility = 'visible'; };
+      previewImg.onerror = function () {
+        previewImg.onerror = null;
+        previewImg.style.visibility = 'hidden';
+        loadPreviewFallback(previewImg, ref);
+      };
+      previewImg.style.visibility = 'hidden';
+      previewImg.src = Comfy.viewUrl(settings.host, ref);
+      caption.textContent = 'Sent: ' + sent.kind +
+        (sent.width && sent.height ? ' (' + sent.width + 'x' + sent.height + ')' : '');
+    } else {
+      preview.style.display = 'none';
+      caption.textContent = 'Nothing sent yet. Open the needed document/layer in Photoshop and press Send all or Send layer.';
+    }
+    return card;
+  }
+
+  async function sendImageSource(img, kind) {
+    if (state.running || state.connecting || state.sending) return;
+    if (!state.connected) { log('Connect to ComfyUI first.', 'err'); return; }
+    state.sending = true;
+    updateConnectionUI();
+    var id = String(img.id);
+    var title = img.title || ('Image #' + img.id);
+    var exportResult = null;
+    try {
+      setStatus('exporting ' + kind, 'busy');
+      log('Sending ' + kind + ' as "' + title + '"...');
+      exportResult = await PS.exportSource(kind);
+      var bytes = await PS.readEntryBytes(exportResult.entry);
+      try {
+        sourcePreviews[id] = arrayBufferToDataUrl(bytes, 'image/png');
+        renderSourceBlocks();
+      } catch (e) { /* preview is optional */ }
+      var uploadName = 'comfyshop_src_' + id + '_' + Date.now() + '.png';
+      var uploaded = await Comfy.uploadImage(settings.host, bytes, uploadName, { overwrite: true });
+      state.sentImages[id] = {
+        name: uploaded.name,
+        subfolder: uploaded.subfolder || '',
+        type: uploaded.type || 'input',
+        kind: kind,
+        origin: exportResult.origin || { x: 0, y: 0 },
+        width: exportResult.width || exportResult.docWidth || 0,
+        height: exportResult.height || exportResult.docHeight || 0,
+        docWidth: exportResult.docWidth || 0,
+        docHeight: exportResult.docHeight || 0,
+        sentAt: Date.now()
+      };
+      saveWorkflowState();
+      setStatus('ready', 'ok');
+      log('Sent ' + kind + ' for "' + title + '".', 'ok');
+    } catch (e) {
+      log('Send failed: ' + friendlyError(e), 'err');
+      setStatus('error', 'bad');
+    } finally {
+      state.sending = false;
+      delete sourcePreviews[id];
+      if (exportResult && exportResult.entry) {
+        try { await PS.deleteEntry(exportResult.entry); } catch (e) { /* ignore */ }
+      }
+      updateConnectionUI();
+    }
   }
 
   function randomSeed() { return Math.floor(Math.random() * 0x7fffffff); }
@@ -1032,11 +1234,9 @@
     });
 
     model.loadImages.forEach(function (img) {
-      if (state.usePs[String(img.id)] === false) {
-        var widget = null;
-        for (var i = 0; i < (img.widgets || []).length; i++) if (img.widgets[i].name === 'image') widget = img.widgets[i];
-        if (widget) put(img.id, 'image', getValue(img.id, widget));
-        else if (img.imageValue !== undefined) put(img.id, 'image', img.imageValue);
+      var sent = state.sentImages[String(img.id)];
+      if (sent && sent.name) {
+        put(img.id, 'image', sent.subfolder ? (sent.subfolder + '/' + sent.name) : sent.name);
       }
     });
 
@@ -1068,39 +1268,16 @@
     return { width: 0, height: 0 };
   }
 
-  async function prepareSource() {
-    var loadImages = state.model.loadImages || [];
-    var useImages = loadImages.filter(function (img) { return state.usePs[String(img.id)] !== false; });
-    if (!useImages.length) return { uploaded: null, exportResult: null, useImages: [] };
-
-    setStatus('exporting', 'busy');
-    log('Exporting ' + settings.sourceKind + '...');
-    var exportResult = await PS.exportSource(settings.sourceKind);
-    debugLog('exported ' + exportResult.path + ' origin=' + JSON.stringify(exportResult.origin));
-
-    var bytes = await PS.readEntryBytes(exportResult.entry);
-    var uploadName = 'comfyshop_' + Date.now() + '.png';
-    log('Uploading ' + uploadName + ' (' + (bytes.byteLength || bytes.length || 0) + ' bytes)...');
-    var uploaded = await Comfy.uploadImage(settings.host, bytes, uploadName, { overwrite: true });
-    debugLog('uploaded as ' + JSON.stringify(uploaded));
-    await PS.deleteEntry(exportResult.entry);
-    exportResult.entry = null;
-    return { uploaded: uploaded, exportResult: exportResult, useImages: useImages };
+  function firstSentMeta() {
+    var images = (state.model && state.model.loadImages) || [];
+    if (!images.length) return null;
+    return state.sentImages[String(images[0].id)] || null;
   }
 
-  async function runOne(prep, index, total) {
+  async function runOne(index, total) {
     var runStarted = Date.now();
     var host = Comfy.normalizeHost(settings.host);
     var overrides = collectOverrides(state.model, total > 1);
-
-    if (prep.uploaded) {
-      var imageRef = prep.uploaded.subfolder ? (prep.uploaded.subfolder + '/' + prep.uploaded.name) : prep.uploaded.name;
-      prep.useImages.forEach(function (img) {
-        var id = String(img.id);
-        overrides[id] = overrides[id] || {};
-        overrides[id].image = imageRef;
-      });
-    }
 
     var built = Convert.buildPrompt(state.workflow, state.objectInfo, overrides, {
       outputIds: state.outputId ? [state.outputId] : null
@@ -1136,16 +1313,12 @@
     var seconds = ((Date.now() - runStarted) / 1000).toFixed(1);
     var time = new Date().toLocaleTimeString().replace(/:/g, '-');
     var runName = baseName + ' ' + time + ' ' + seconds + 's';
-    var origin = prep.exportResult ? prep.exportResult.origin : { x: 0, y: 0 };
-    var targetWidth = prep.exportResult && prep.exportResult.width
-      ? prep.exportResult.width
-      : (prep.exportResult ? prep.exportResult.docWidth : 0);
-    var targetHeight = prep.exportResult && prep.exportResult.height
-      ? prep.exportResult.height
-      : (prep.exportResult ? prep.exportResult.docHeight : 0);
+    var meta = firstSentMeta();
+    var origin = meta && meta.origin ? meta.origin : { x: 0, y: 0 };
+    var targetWidth = meta && meta.width ? meta.width : (meta ? meta.docWidth : 0);
+    var targetHeight = meta && meta.height ? meta.height : (meta ? meta.docHeight : 0);
 
     var lastInserted = null;
-    var lastBuffer = null;
 
     for (var n = 0; n < images.length; n++) {
       var image = images[n];
@@ -1166,7 +1339,6 @@
           width: targetWidth || size.width,
           height: targetHeight || size.height
         });
-        lastBuffer = arrayBuffer;
       } finally {
         try { await PS.deleteEntry(temp); } catch (e) { /* ignore */ }
       }
@@ -1177,15 +1349,16 @@
       log('Inserted layer "' + lastInserted.layerName + '".', 'ok');
     }
 
-    if (lastBuffer) showPreview(lastBuffer, lastInserted.layerName);
     return lastInserted;
   }
 
   async function generateBatch(count) {
     if (state.running) return null;
+    if (state.sending) { log('Wait for the image to finish sending.', 'err'); return null; }
     if (!state.connected) { log('Connect to ComfyUI first.', 'err'); return null; }
     if (!state.model || !state.workflow) { log('No workflow selected.', 'err'); return null; }
-    if (!PS.documentInfo()) { log('Open a document in Photoshop first.', 'err'); return null; }
+    var docInfo = PS.documentInfoLight ? PS.documentInfoLight() : PS.documentInfo();
+    if (!docInfo) { log('Open a document in Photoshop first.', 'err'); return null; }
     if (state.model.errors && state.model.errors.length) {
       log(friendlyError(new Error(state.model.errors[0])), 'err');
       return null;
@@ -1196,19 +1369,22 @@
     state.batch = { total: count, done: 0 };
     setProgress(0);
     var started = Date.now();
-    var prep = null;
-    debugLog('generateBatch start count=' + count + ' workflow=' + state.workflowName + ' source=' + settings.sourceKind);
+    debugLog('generateBatch start count=' + count + ' workflow=' + state.workflowName);
 
     try {
       await ensureObjectInfo();
       state.model = Convert.buildModel(state.workflow, state.objectInfo);
       if (state.model.errors && state.model.errors.length) throw new Error(state.model.errors[0]);
 
-      prep = await prepareSource();
+      sourceImages().forEach(function (img) {
+        if (!state.sentImages[String(img.id)]) {
+          log('Image "' + (img.title || ('#' + img.id)) + '" was not sent - using the workflow image.', 'warn');
+        }
+      });
 
       for (var i = 0; i < count; i++) {
         if (state.cancelRequested) break;
-        await runOne(prep, i, count);
+        await runOne(i, count);
         if (state.cancelRequested) break;
         state.batch.done = i + 1;
         setProgress(((i + 1) / count) * 100);
@@ -1235,30 +1411,12 @@
         debugLog('generateBatch failed: ' + (err && (err.stack || err.message || err)));
         setStatus('error', 'bad');
         log(friendlyError(err), 'err');
+        if (isNetworkError(err)) markOffline();
       }
       return null;
     } finally {
-      if (prep && prep.exportResult && prep.exportResult.entry) {
-        try { await PS.deleteEntry(prep.exportResult.entry); } catch (e) { /* ignore */ }
-      }
       setRunning(false);
       updateDocHint();
-    }
-  }
-
-  function showPreview(arrayBuffer, caption) {
-    try {
-      var bytes = new Uint8Array(arrayBuffer);
-      var binary = '';
-      var chunk = 0x8000;
-      for (var i = 0; i < bytes.length; i += chunk) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-      }
-      state.els.previewImg.src = 'data:image/png;base64,' + btoa(binary);
-      state.els.previewCaption.textContent = caption;
-      state.els.preview.classList.add('visible');
-    } catch (e) {
-      log('Preview unavailable: ' + (e.message || e));
     }
   }
 
@@ -1283,7 +1441,9 @@
     var root = build();
     state.panelRoot = root;
     state.els.hostInput.value = settings.host;
-    state.els.srcDropdown.setValue(settings.sourceKind, false);
+    if (!docWatchTimer) {
+      docWatchTimer = setInterval(updateDocHint, 1500);
+    }
     if (!initialized) {
       initialized = true;
       setTimeout(function () {
@@ -1291,10 +1451,11 @@
           .then(function () {
             applyExternalConfig();
             state.els.hostInput.value = settings.host;
-            state.els.srcDropdown.setValue(settings.sourceKind, false);
-            return refreshWorkflowList();
+            /* Auto-connect on startup with the saved server address. */
+            return state.connected ? refreshWorkflowList() : connect();
           })
           .then(function () {
+            startWatchdog();
             updateDocHint();
           })
           .catch(function (e) {

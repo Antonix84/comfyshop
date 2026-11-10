@@ -165,7 +165,12 @@
     if (options.subfolder) field('subfolder', options.subfolder);
 
     var name = fileName || ('comfyshop_' + Date.now() + '.png');
-    var mime = /\.jpe?g$/i.test(name) ? 'image/jpeg' : 'image/png';
+    var mime = /\.jpe?g$/i.test(name) ? 'image/jpeg'
+      : /\.webp$/i.test(name) ? 'image/webp'
+      : /\.gif$/i.test(name) ? 'image/gif'
+      : /\.bmp$/i.test(name) ? 'image/bmp'
+      : /\.tiff?$/i.test(name) ? 'image/tiff'
+      : 'image/png';
     chunks.push(utf8Bytes('--' + boundary + '\r\n' +
       'Content-Disposition: form-data; name="image"; filename="' + name + '"\r\n' +
       'Content-Type: ' + mime + '\r\n\r\n'));

@@ -34,7 +34,7 @@
   }
 
   function withModal(fn, commandName) {
-    return core.executeAsModal(fn, { commandName: commandName || 'ComfyShop' });
+    return core.executeAsModal(fn, { commandName: commandName || 'ComfyShop', interactive: false });
   }
 
   function pixelDescriptor(value) {
@@ -207,6 +207,7 @@
 
   async function cropDocument(doc, rect) {
     try {
+      await deselect(doc);
       await batchPlay([{
         _obj: 'crop',
         rect: {
@@ -218,8 +219,37 @@
         useSelectedLayer: false,
         _options: { dialogOptions: 'dontDisplay' }
       }], { documentID: doc.id });
+      return true;
     } catch (e) {
-      await doc.crop({ top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right });
+      /* Never fall back to doc.crop(): on some documents it opens a modal
+       * "selection is empty" error. The caller handles a failed crop. */
+      return false;
+    }
+  }
+
+  async function deselect(doc) {
+    try {
+      if (doc && doc.selection) await doc.selection.deselect();
+    } catch (e) { /* no selection / not supported */ }
+  }
+
+  /* Trim transparent padding instead of using the crop command. Crop can
+   * show a modal "selected area is empty" error on some layer documents. */
+  async function trimTransparent(doc) {
+    try {
+      await deselect(doc);
+      await batchPlay([{
+        _obj: 'trim',
+        trimType: 'transparent',
+        top: true,
+        left: true,
+        bottom: true,
+        right: true,
+        _options: { dialogOptions: 'dontDisplay' }
+      }], { documentID: doc.id });
+      return true;
+    } catch (e) {
+      return false;
     }
   }
 
@@ -236,6 +266,7 @@
       bits: doc.bitsPerChannel,
       layers: doc.layers ? doc.layers.length : 0
     };
+
     try {
       var active = doc.activeLayers && doc.activeLayers[0];
       if (active) {
@@ -248,6 +279,13 @@
       info.selection = selectionBounds(doc);
     } catch (e) { /* ignore */ }
     return info;
+  }
+
+  /* Lightweight active-document check used by the panel's document hint. */
+  function documentInfoLight() {
+    var doc = app && app.activeDocument;
+    if (!doc) return null;
+    return { name: doc.name, width: Math.round(doc.width), height: Math.round(doc.height) };
   }
 
   /* Export the requested source to a PNG in Photoshop's temp folder.
@@ -265,7 +303,7 @@
     /* Everything that only exists in the source document must be captured
      * before duplicating: the duplicate does not reliably keep the selection,
      * and layer ids/paths may change. */
-    var selRect = selectionBounds(source);
+    var selRect = kind === 'selection' ? selectionBounds(source) : null;
     var active = source.activeLayers && source.activeLayers[0];
     var keepId = active ? active.id : null;
     var keepName = active ? active.name : null;
@@ -288,15 +326,29 @@
           crop = options.alignToEven ? evenRect(selRect, duplicate) : clampRect(selRect, duplicate);
           if (!crop) throw new Error('The selection is empty or outside the canvas.');
           origin = { x: crop.left, y: crop.top };
-          await cropDocument(duplicate, crop);
+          if (!await cropDocument(duplicate, crop)) throw new Error('Photoshop could not crop the selection area.');
         } else if (kind === 'layer') {
           if (!isolateLayer(duplicate.layers, keepId, keepName, keepPath && keepPath.path)) {
             throw new Error('The active layer could not be isolated for export.');
           }
           if (keepBounds) {
-            crop = options.alignToEven ? evenRect(keepBounds, duplicate) : clampRect(keepBounds, duplicate);
-            origin = { x: (crop || keepBounds).left, y: (crop || keepBounds).top };
-            if (crop) await cropDocument(duplicate, crop);
+            var dupW = Math.round(duplicate.width);
+            var dupH = Math.round(duplicate.height);
+            var fullCanvas = keepBounds.left <= 0 && keepBounds.top <= 0 &&
+              keepBounds.right >= dupW && keepBounds.bottom >= dupH;
+            if (fullCanvas) {
+              crop = null;
+              origin = { x: 0, y: 0 };
+            } else {
+              crop = keepBounds;
+              origin = { x: keepBounds.left, y: keepBounds.top };
+              if (!await trimTransparent(duplicate)) {
+                /* Empty/edge layers may not trim; keep the full transparent
+                 * canvas instead of showing a Photoshop error dialog. */
+                crop = null;
+                origin = { x: 0, y: 0 };
+              }
+            }
           }
         } else {
           await duplicate.flatten();
@@ -576,6 +628,7 @@
     app: app,
     withModal: withModal,
     documentInfo: documentInfo,
+    documentInfoLight: documentInfoLight,
     exportSource: exportSource,
     insertFile: insertFile,
     getTempFile: getTempFile,

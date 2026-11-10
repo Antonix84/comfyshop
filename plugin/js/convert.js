@@ -67,6 +67,11 @@
    *   #KSampler::!cfg             expose everything except "cfg"
    *   #Prompt?                    exposed but collapsed by default
    *   (no "#")                    node is not exposed
+   *
+   * Widgets can be narrowed down too: rename an input label inside a "#"
+   * node so that it starts with "#" (e.g. "#megapixels"). If at least one
+   * input is marked, only marked widgets are shown; otherwise all widgets
+   * are shown as before.
    */
   function titleSource(node, fallbackType) {
     var raw = node && node.title ? String(node.title) : (fallbackType || '');
@@ -139,6 +144,37 @@
 
     out.label = t || out.label;
     return out;
+  }
+
+  /*
+   * Per-widget "#" markers.
+   *
+   * ComfyUI stores a renamed widget label on the node input, e.g.
+   *   { "name": "megapixels", "label": "#megapixels" }
+   * When a node title starts with "#", only widgets whose input carries such
+   * a marker are shown/edited in the panel. Nodes without any marked input
+   * keep their old behaviour (all widgets), so existing workflows still work.
+   */
+  function hashName(value) {
+    var s = value === undefined || value === null ? '' : String(value).trim();
+    if (s.charAt(0) !== '#') return null;
+    return s.replace(/^#+\s*/, '').trim();
+  }
+
+  function widgetMarks(node) {
+    var marks = {};
+    var inputs = node && node.inputs;
+    if (!Array.isArray(inputs)) return marks;
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      if (!input || input.name === undefined || input.name === null) continue;
+      var label = hashName(input.label);
+      if (label === null) label = hashName(input.localized_name);
+      if (label === null) label = hashName(input.name);
+      if (label === null) continue;
+      marks[String(input.name)] = label || String(input.name);
+    }
+    return marks;
   }
 
   /* ------------------------------------------------------------------ */
@@ -283,6 +319,62 @@
     var errors = [];
     var expanded = 0;
 
+    function num(v, fallback) {
+      var n = Number(v);
+      return isNaN(n) ? fallback : n;
+    }
+
+    /* Old exports store links as arrays, newer ones as objects
+     * ({id, origin_id, origin_slot, target_id, target_slot, type}). */
+    function normalizeSubgraphLink(l) {
+      if (Array.isArray(l) && l.length >= 6) {
+        return { id: l[0], origin_id: l[1], origin_slot: l[2], target_id: l[3], target_slot: l[4], type: l[5] };
+      }
+      if (l && typeof l === 'object') {
+        var id = l.id !== undefined ? l.id : l.link_id;
+        var origin = l.origin_id !== undefined ? l.origin_id : (l.originId !== undefined ? l.originId : l.source);
+        var target = l.target_id !== undefined ? l.target_id : (l.targetId !== undefined ? l.targetId : l.target);
+        if (id === undefined || origin === undefined || target === undefined) return null;
+        return {
+          id: id,
+          origin_id: origin,
+          origin_slot: l.origin_slot !== undefined ? l.origin_slot : l.originSlot,
+          target_id: target,
+          target_slot: l.target_slot !== undefined ? l.target_slot : l.targetSlot,
+          type: l.type
+        };
+      }
+      return null;
+    }
+
+    function inputNodeId(def) {
+      if (def.input_node !== undefined && def.input_node !== null) return def.input_node;
+      if (def.inputNode && def.inputNode.id !== undefined) return def.inputNode.id;
+      return null;
+    }
+
+    function outputNodeId(def) {
+      if (def.output_node !== undefined && def.output_node !== null) return def.output_node;
+      if (def.outputNode && def.outputNode.id !== undefined) return def.outputNode.id;
+      return null;
+    }
+
+    /* Inner link ids are only unique inside a subgraph definition - two
+     * definitions can both contain link 167. Inlined links therefore get a
+     * fresh id and the inner node references are remapped below. */
+    var maxLinkId = 0;
+    links.forEach(function (l) {
+      var v = Number(Array.isArray(l) ? l[0] : (l && l.id));
+      if (!isNaN(v) && v > maxLinkId) maxLinkId = v;
+    });
+    defs.forEach(function (d) {
+      (d.links || []).forEach(function (raw) {
+        var l = normalizeSubgraphLink(raw);
+        if (l && Number(l.id) > maxLinkId) maxLinkId = Number(l.id);
+      });
+    });
+    var nextLinkId = maxLinkId + 1;
+
     for (var i = 0; i < workflow.nodes.length; i++) {
       var node = workflow.nodes[i];
       var def = findSubgraph(defs, node);
@@ -300,81 +392,172 @@
         remap[String(inn.id)] = idOffset + innId;
       });
 
-      /* 1. copy inner links, remapping node ids */
-      /* links starting at the virtual input node are rebuilt in step 2 */
-      var innerOutward = {};
-      (def.links || []).forEach(function (l) {
-        if (!Array.isArray(l) || l.length < 6) return;
-        if (def.input_node !== undefined && String(l[1]) === String(def.input_node)) {
-          innerOutward[String(l[0])] = l;
-          return;
+      var virtualIn = inputNodeId(def);
+      var virtualOut = outputNodeId(def);
+      var defLinks = (def.links || []).map(normalizeSubgraphLink).filter(Boolean);
+      var defLinkById = {};
+      defLinks.forEach(function (l) { defLinkById[String(l.id)] = l; });
+
+      /* Old definitions may omit inputNode/outputNode; ComfyUI uses
+       * negative ids for these virtual nodes. */
+      if (virtualIn === null) {
+        for (var vin = 0; vin < defLinks.length; vin++) {
+          if (Number(defLinks[vin].origin_id) < 0) { virtualIn = defLinks[vin].origin_id; break; }
         }
-        var origin = remap[String(l[1])];
-        var target = remap[String(l[3])];
+      }
+      if (virtualOut === null) {
+        for (var vout = 0; vout < defLinks.length; vout++) {
+          if (Number(defLinks[vout].target_id) < 0) { virtualOut = defLinks[vout].target_id; break; }
+        }
+      }
+
+      /* Unique ids for every inlined link of this subgraph instance. */
+      var linkRemap = {};
+      defLinks.forEach(function (l) { linkRemap[String(l.id)] = nextLinkId++; });
+
+      /* 1. copy inner links, remapping node + link ids. Links from/to the
+       * virtual input/output nodes are skipped; they connect to the outer graph. */
+      defLinks.forEach(function (l) {
+        if (virtualIn !== null && String(l.origin_id) === String(virtualIn)) return;
+        if (virtualOut !== null && String(l.target_id) === String(virtualOut)) return;
+        var origin = remap[String(l.origin_id)];
+        var target = remap[String(l.target_id)];
         if (origin === undefined || target === undefined) return;
-        var copy = [l[0], origin, l[2], target, l[4], l[5]];
+        var newId = linkRemap[String(l.id)];
+        var copy = [newId, origin, num(l.origin_slot, 0), target, num(l.target_slot, 0), l.type];
         links.push(copy);
-        linkIndex[String(l[0])] = copy;
+        linkIndex[String(newId)] = copy;
       });
 
       /* 2. outer inputs -> consumers of the subgraph input node */
-      var inputOrder = (def.inputs || []).map(function (d) { return String(d.name); });
-      (node.inputs || []).forEach(function (outer) {
+      var inputDefs = def.inputs || [];
+      (node.inputs || []).forEach(function (outer, outerIndex) {
         if (outer.link === null || outer.link === undefined) return;
         var outerLink = linkIndex[String(outer.link)];
         if (!outerLink) return;
-        var slot = inputOrder.indexOf(String(outer.name));
-        if (slot < 0) slot = 0;
+
+        var defInput = null;
+        for (var di = 0; di < inputDefs.length; di++) {
+          if (String(inputDefs[di].name) === String(outer.name)) { defInput = inputDefs[di]; break; }
+        }
+        if (!defInput && inputDefs[outerIndex]) defInput = inputDefs[outerIndex];
+
+        var ids = [];
+        if (defInput && Array.isArray(defInput.linkIds)) {
+          ids = defInput.linkIds.map(String);
+        }
+        if (!ids.length) {
+          /* Older definitions only have slot numbers on the inner links. */
+          var slot = -1;
+          for (var si = 0; si < inputDefs.length; si++) {
+            if (String(inputDefs[si].name) === String(outer.name)) { slot = si; break; }
+          }
+          if (slot < 0) slot = outerIndex;
+          defLinks.forEach(function (l) {
+            if (virtualIn !== null && String(l.origin_id) === String(virtualIn) &&
+                num(l.origin_slot, 0) === slot) ids.push(String(l.id));
+          });
+        }
+
         var wired = 0;
-        Object.keys(innerOutward).forEach(function (lid) {
-          var src = innerOutward[lid];
-          if (Number(src[2]) !== slot) return;
-          var existing = linkIndex[String(lid)];
-          if (existing) { existing[1] = outerLink[1]; existing[2] = outerLink[2]; wired++; return; }
-          var created = [src[0], outerLink[1], outerLink[2], remap[String(src[3])], src[4], src[5]];
-          if (remap[String(src[3])] === undefined) return;
+        ids.forEach(function (lid) {
+          var inner = defLinkById[lid];
+          if (!inner) return;
+          var target = remap[String(inner.target_id)];
+          if (target === undefined) return;
+          var newLid = linkRemap[lid];
+          if (newLid === undefined) return;
+          var created = [newLid, outerLink[1], outerLink[2], target, num(inner.target_slot, 0), inner.type];
           links.push(created);
-          linkIndex[String(lid)] = created;
+          linkIndex[String(newLid)] = created;
           wired++;
         });
         if (!wired) warnings.push('Subgraph "' + (def.name || def.id) + '": nothing consumes input "' + outer.name + '".');
       });
 
-      /* 3. outer outputs -> the definition output nodes */
-      var outDefs = def.output_nodes || [];
+      /* 3. outer outputs -> the definition output nodes / inner link sources */
+      var oldOutDefs = def.output_nodes || [];
+      var newOutDefs = def.outputs || [];
       (node.outputs || []).forEach(function (outer, index) {
-        var src = null;
-        for (var o = 0; o < outDefs.length; o++) {
-          var cand = outDefs[o];
-          var nm = cand.name || cand.code || cand.slot_name;
-          if (String(nm) === String(outer.name)) { src = cand; break; }
+        var source = null;
+
+        var defOut = null;
+        for (var no = 0; no < newOutDefs.length; no++) {
+          var candOut = newOutDefs[no];
+          if (String(candOut.name) === String(outer.name) ||
+              (candOut.label && outer.label && String(candOut.label) === String(outer.label))) {
+            defOut = candOut;
+            break;
+          }
         }
-        if (!src && outDefs[index]) src = outDefs[index];
-        if (!src) {
+        if (!defOut && newOutDefs[index]) defOut = newOutDefs[index];
+        if (defOut && Array.isArray(defOut.linkIds) && defOut.linkIds.length) {
+          var innerOut = defLinkById[String(defOut.linkIds[0])];
+          if (innerOut) source = { id: innerOut.origin_id, slot: num(innerOut.origin_slot, 0) };
+        }
+
+        if (!source) {
+          var src = null;
+          for (var o = 0; o < oldOutDefs.length; o++) {
+            var cand = oldOutDefs[o];
+            var nm = cand.name || cand.code || cand.slot_name;
+            if (String(nm) === String(outer.name)) { src = cand; break; }
+          }
+          if (!src && oldOutDefs[index]) src = oldOutDefs[index];
+          if (src) {
+            source = {
+              id: src.id,
+              slot: src.slot === undefined ? (src.data && src.data.slot) || 0 : src.slot
+            };
+          }
+        }
+
+        if (!source) {
           warnings.push('Subgraph "' + (def.name || def.id) + '": output "' + outer.name + '" is not mapped, downstream nodes will lose their input.');
+          return;
+        }
+        var remappedSource = remap[String(source.id)];
+        if (remappedSource === undefined) {
+          warnings.push('Subgraph "' + (def.name || def.id) + '": output "' + outer.name + '" comes from an unknown inner node #' + source.id + '.');
           return;
         }
         (outer.links || []).forEach(function (lid) {
           var l = linkIndex[String(lid)];
           if (!l) return;
-          l[1] = remap[String(src.id)];
-          l[2] = src.slot === undefined ? (src.data && src.data.slot) || 0 : src.slot;
+          l[1] = remappedSource;
+          l[2] = num(source.slot, 0);
         });
       });
 
       /* 4. copy the inner nodes themselves */
       innerNodes.forEach(function (inn) {
-        if (def.input_node !== undefined && String(inn.id) === String(def.input_node)) return;
+        if (virtualIn !== null && String(inn.id) === String(virtualIn)) return;
+        if (virtualOut !== null && String(inn.id) === String(virtualOut)) return;
         nodes.push({
           id: remap[String(inn.id)],
           type: inn.type,
           title: inn.title || null,
           mode: inn.mode === undefined ? 0 : inn.mode,
           inputs: (inn.inputs || []).map(function (inp) {
-            return { name: inp.name, type: inp.type, link: inp.link };
+            var copy = {
+              name: inp.name,
+              type: inp.type,
+              link: inp.link === null || inp.link === undefined ? inp.link
+                : (linkRemap[String(inp.link)] !== undefined ? linkRemap[String(inp.link)] : inp.link)
+            };
+            if (inp.label !== undefined) copy.label = inp.label;
+            if (inp.localized_name !== undefined) copy.localized_name = inp.localized_name;
+            if (inp.widget !== undefined) copy.widget = inp.widget;
+            return copy;
           }),
           outputs: (inn.outputs || []).map(function (o) {
-            return { name: o.name, type: o.type, links: (o.links || []).slice() };
+            return {
+              name: o.name,
+              type: o.type,
+              links: (o.links || []).map(function (lid) {
+                return linkRemap[String(lid)] !== undefined ? linkRemap[String(lid)] : lid;
+              })
+            };
           }),
           widgets_values: (inn.widgets_values || []).slice(),
           widgets_values_named: inn.widgets_values_named,
@@ -1187,6 +1370,22 @@
     var outputs = detectOutputs(wf, objectInfo, nodesById, linksById);
     var needed = outputs.length ? collectNeeded(outputs.map(function (o) { return o.id; }), nodesById, linksById) : null;
 
+    /* If any "#" node uses "#widget" input labels, the workflow opts into
+     * strict mode: every "#" node then shows only its marked widgets. Old
+     * workflows without widget marks keep showing all widgets. */
+    var strictWidgetMarks = false;
+    for (var sm = 0; sm < nodes.length; sm++) {
+      var sn = nodes[sm];
+      if (!sn || !sn.type || passthroughType(sn.type) || !isActive(sn)) continue;
+      if (needed && !needed[String(sn.id)]) continue;
+      if (!parseTitle(sn, sn.type).exposed) continue;
+      var snMarks = widgetMarks(sn);
+      if (!Object.keys(snMarks).length) continue;
+      var snWidgets = nodeWidgets(sn, objectInfo[sn.type]).widgets;
+      var hasMark = snWidgets.some(function (w) { return snMarks[String(w.name)] !== undefined; });
+      if (hasMark) { strictWidgetMarks = true; break; }
+    }
+
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
       if (!node || !node.type) continue;
@@ -1217,6 +1416,25 @@
         filtered = widgets.filter(function (x) { return title.except.indexOf(x.name) < 0; });
       }
 
+      /* "#widget" labels inside a "#node": show only the marked widgets. */
+      var marks = title.exposed ? widgetMarks(node) : {};
+      var widgetNames = {};
+      widgets.forEach(function (x) { widgetNames[String(x.name)] = true; });
+      var markedNames = Object.keys(marks).filter(function (key) { return !!widgetNames[key]; });
+      if (strictWidgetMarks && title.exposed) {
+        filtered = filtered.filter(function (x) {
+          return marks[String(x.name)] !== undefined;
+        });
+      }
+      filtered.forEach(function (x) {
+        var marked = marks[String(x.name)];
+        if (marked !== undefined) {
+          x.label = marked;
+          x.displayName = marked;
+          x.marked = true;
+        }
+      });
+
       /* image / mask upload nodes */
       var isLoadImage = node.type === 'LoadImage' || /LoadImage(FromPath)?$/.test(String(node.type));
       var isLoadMask = /LoadImageMask|LoadMask/i.test(String(node.type));
@@ -1233,6 +1451,9 @@
           widgets: widgets,
           exposed: title.exposed,
           needed: isNeeded,
+          markedNames: markedNames,
+          strictMarks: strictWidgetMarks,
+          imageLabel: marks['image'] || marks['mask'] || null,
           imageValue: pickValue(widgets, 'image') !== undefined ? pickValue(widgets, 'image') : pickValue(widgets, 'mask')
         };
         if (isLoadMask) loadMasks.push(entry); else loadImages.push(entry);
@@ -1248,6 +1469,8 @@
           order: title.explicitOrder ? title.order : 1000 + i,
           collapsed: title.collapsed,
           only: title.only,
+          markedNames: markedNames,
+          strictMarks: strictWidgetMarks,
           widgets: filtered,
           allWidgets: widgets,
           isLoadImage: isLoadImage,
