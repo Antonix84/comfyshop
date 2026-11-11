@@ -86,6 +86,7 @@ Set `COMFY_HOST`, `COMFY_WORKFLOW`, and `COMFY_IMAGE` environment variables to t
 - `Reload` clears the sent images and restores the workflow's stored images.
 - Missing custom nodes are reported only when the selected output actually needs them; unused unknown nodes are skipped.
 - Both legacy `widgets_values` and newer `widgets_values_named` are supported, including the newer `COMBO` input format used by nodes such as `ImageScaleToTotalPixels`.
+- Text prompt nodes (`PrimitiveStringMultiline`, e.g. `#2 Prompt`) feed the encoder as an inlined literal, so editing them in the panel does take effect. A widget input that is connected to a link is not shown in the panel: ComfyUI would ignore the value, because the link wins.
 - The panel is inspired by the concept of SD-PPP but is an independent implementation.
 
 ## License

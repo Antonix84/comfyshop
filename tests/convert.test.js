@@ -53,6 +53,11 @@ const OBJECT_INFO = {
     output: ['CONDITIONING'],
     name: 'CLIPTextEncode'
   },
+  PrimitiveStringMultiline: {
+    input: { required: { value: ['STRING', { multiline: true, default: '' }] } },
+    output: ['STRING'],
+    name: 'PrimitiveStringMultiline'
+  },
   EmptyLatentImage: {
     input: { required: { width: ['INT', { default: 512, min: 16, max: 8192, step: 8 }], height: ['INT', { default: 512, min: 16, max: 8192, step: 8 }], batch_size: ['INT', { default: 1, min: 1, max: 64 }] } },
     output: ['LATENT'],
@@ -719,6 +724,58 @@ test('DynamicCombo sub-seeds are varied too', () => {
   });
   eq(p.prompt['522'].inputs['sampling_mode.seed'], 424242, 'sampling seed');
   eq(p.prompt['522'].inputs['sampling_mode.temperature'], 0.7, 'temperature untouched');
+});
+
+/* ------------------------------------------------------------------ */
+/* Prompt nodes: primitives and linked widgets                          */
+/* ------------------------------------------------------------------ */
+
+console.log('\nconvert.js - prompt primitives');
+
+/* A "#Prompt" primitive feeds CLIPTextEncode.text, like the "#2 Promt"
+ * nodes in the 9B / FLUX3 workflows. */
+function primitivePromptWorkflow() {
+  return {
+    nodes: [
+      node(1, 'CheckpointLoaderSimple', {
+        widgets: ['sd15.safetensors'],
+        outputs: [out(1, 'CLIP', 'CLIP', [11])]
+      }),
+      node(20, 'PrimitiveStringMultiline', {
+        title: '#Prompt',
+        outputs: [out(20, 'STRING', 'STRING', [30])],
+        widgets: ['text stored in the workflow']
+      }),
+      node(21, 'CLIPTextEncode', {
+        title: '#Text',
+        inputs: [{ name: 'text', type: 'STRING', widget: { name: 'text' }, link: 30 }, txt(11, 'clip')],
+        outputs: [out(21, 'CONDITIONING', 'CONDITIONING', [31])],
+        widgets: ['text stored in the workflow']
+      })
+    ],
+    links: [link(11, 1, 1, 21, 1, 'CLIP'), link(30, 20, 0, 21, 0, 'STRING')]
+  };
+}
+
+test('an edited primitive is inlined with the new text, not the stored one', () => {
+  const p = Convert.buildPrompt(primitivePromptWorkflow(), OBJECT_INFO, { 20: { value: 'my new prompt' } }, { outputIds: [21] });
+  eq(p.errors, [], 'errors');
+  eq(p.prompt['21'].inputs.text, 'my new prompt', 'text');
+  eq('20' in p.prompt, false, 'primitive is inlined');
+});
+
+test('the stored primitive text is used when it is not edited', () => {
+  const p = Convert.buildPrompt(primitivePromptWorkflow(), OBJECT_INFO, {}, { outputIds: [21] });
+  eq(p.prompt['21'].inputs.text, 'text stored in the workflow', 'text');
+});
+
+test('a linked widget input is not offered as an editable field', () => {
+  const m = Convert.buildModel(primitivePromptWorkflow(), OBJECT_INFO);
+  const enc = m.exposed.filter((n) => n.id === 21)[0];
+  ok(enc, 'node exposed');
+  eq(enc.widgets.some((w) => w.name === 'text'), false, 'linked text widget hidden');
+  const prim = m.exposed.filter((n) => n.id === 20)[0];
+  ok(prim.widgets.some((w) => w.name === 'value'), 'the primitive stays editable');
 });
 
 /* ------------------------------------------------------------------ */

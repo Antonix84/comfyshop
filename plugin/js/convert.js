@@ -1024,7 +1024,19 @@
     return fallback;
   }
 
-  function primitiveValueOf(node) {
+  function primitiveValueOf(node, ctx) {
+    /* An override from the panel wins over the value stored in the workflow:
+     * primitives are inlined as literals, so the edited text would otherwise
+     * be dropped together with the primitive node. */
+    var ov = ctx && ctx.overrides ? ctx.overrides[String(node.id)] : null;
+    if (isPlainObject(ov)) {
+      var names = ['value', 'text', 'string', 'prompt', 'number', 'int', 'float', 'boolean'];
+      for (var i = 0; i < names.length; i++) {
+        if (ov[names[i]] !== undefined) return { literal: ov[names[i]] };
+      }
+      var keys = Object.keys(ov);
+      if (keys.length && ov[keys[0]] !== undefined) return { literal: ov[keys[0]] };
+    }
     var named = node.widgets_values_named;
     if (isPlainObject(named)) {
       if (named.value !== undefined) return { literal: named.value };
@@ -1040,7 +1052,7 @@
     var node = ctx.nodesById[String(nodeId)];
     if (!node) return null;
 
-    if (isPrimitiveLike(node.type)) return primitiveValueOf(node);
+    if (isPrimitiveLike(node.type)) return primitiveValueOf(node, ctx);
 
     if (/reroute/i.test(String(node.type)) || passthroughType(node.type)) {
       var rin = node.inputs && node.inputs[0];
@@ -1118,12 +1130,30 @@
   /* UI model                                                            */
   /* ------------------------------------------------------------------ */
 
+  /* Widget inputs connected to a link are sockets in ComfyUI, not editable
+   * widgets. The panel must not show them: an edit would be silently ignored
+   * because the link (e.g. a "#2 Promt" primitive) provides the real value. */
+  function linkedInputNames(node) {
+    var names = {};
+    var inputs = node && node.inputs;
+    if (!Array.isArray(inputs)) return names;
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      if (!input || input.name === undefined || input.name === null) continue;
+      if (input.link === null || input.link === undefined) continue;
+      names[String(input.name)] = true;
+    }
+    return names;
+  }
+
   function nodeWidgets(node, definition) {
     var specs = widgetSpecs(definition);
     var aligned = alignWidgets(node, specs);
+    var linked = linkedInputNames(node);
     var widgets = [];
     for (var w = 0; w < specs.length; w++) {
       var spec = specs[w];
+      if (linked[spec.name]) continue;
       var widget = {
         nodeId: node.id,
         name: spec.name,
@@ -1686,7 +1716,7 @@
       }
     }
 
-    var ctx = { nodesById: makeNodesIndex(wf), linksById: makeLinksIndex(wf) };
+    var ctx = { nodesById: makeNodesIndex(wf), linksById: makeLinksIndex(wf), overrides: overrides };
     var nodes = wf.nodes;
 
     var roots = options.outputIds && options.outputIds.length ? options.outputIds.slice() : null;
