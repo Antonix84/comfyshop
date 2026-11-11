@@ -600,10 +600,27 @@
     return null;
   }
 
+  /* DynamicCombo (COMFY_DYNAMICCOMBO_V3) - a combo whose options carry their
+   * own inputs, e.g. TextGenerate's "sampling_mode". Options are objects
+   * { key, inputs }, so they must not be treated as plain combo values. */
+  function dynamicComboOptions(type, opts) {
+    if (upper(type) !== 'COMFY_DYNAMICCOMBO_V3') return null;
+    var list = opts && Array.isArray(opts.options) ? opts.options : null;
+    if (!list) return null;
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var option = list[i];
+      if (!option || typeof option.key !== 'string') continue;
+      out.push(option);
+    }
+    return out.length ? out : null;
+  }
+
   function isWidgetInput(name, spec) {
     var type = Array.isArray(spec) ? spec[0] : spec;
     var opts = inputOptions(spec);
     if (opts.forceInput) return false;
+    if (dynamicComboOptions(type, opts)) return true;
     if (typeof type === 'string' && PRIMITIVE_TYPES[type]) return true;
     if (comboValues(type, opts)) return true;
     if (typeof type === 'string' && upper(type) === 'COMBO') return true;
@@ -633,6 +650,21 @@
         var kind = isCombo ? 'combo' : lower(String(type) === 'CUSTOM' ? (opts.multiline ? 'text' : 'string') : String(type));
 
         if (kind === 'string') kind = opts.multiline ? 'text' : 'string';
+
+        var dynamic = dynamicComboOptions(type, opts);
+        if (dynamic) {
+          specs.push({
+            name: name,
+            kind: 'combo',
+            type: 'COMBO',
+            values: dynamic.map(function (option) { return option.key; }),
+            options: opts,
+            required: s === 0,
+            'default': opts['default'],
+            dynamic: dynamic
+          });
+          continue;
+        }
 
         specs.push({
           name: name,
@@ -679,6 +711,67 @@
     if (spec.options && spec.options.control_after_generate) return true;
     if (spec.kind !== 'int') return false;
     return !!SEED_NAMES[spec.name];
+  }
+
+  /* Nested widget specs of the selected DynamicCombo option. ComfyUI sends
+   * those as flat "parent.child" inputs next to the selected key. */
+  function dynamicNestedSpecs(spec, selected) {
+    var out = [];
+    if (!spec || !spec.dynamic) return out;
+    var chosen = null;
+    for (var i = 0; i < spec.dynamic.length; i++) {
+      if (String(spec.dynamic[i].key) === String(selected)) { chosen = spec.dynamic[i]; break; }
+    }
+    if (!chosen || !isPlainObject(chosen.inputs)) return out;
+    var sections = [chosen.inputs.required, chosen.inputs.optional];
+    for (var s = 0; s < sections.length; s++) {
+      var section = sections[s];
+      if (!section || !isPlainObject(section)) continue;
+      var names = Object.keys(section);
+      for (var n = 0; n < names.length; n++) {
+        var name = names[n];
+        var raw = section[name];
+        if (!isWidgetInput(name, raw)) continue;
+        var opts = inputOptions(raw);
+        var type = Array.isArray(raw) ? raw[0] : raw;
+        var values = comboValues(type, opts);
+        var isCombo = !!values || upper(type) === 'COMBO';
+        var kind = isCombo ? 'combo' : lower(String(type) === 'CUSTOM' ? (opts.multiline ? 'text' : 'string') : String(type));
+        if (kind === 'string') kind = opts.multiline ? 'text' : 'string';
+        out.push({
+          name: spec.name + '.' + name,
+          kind: kind,
+          type: isCombo ? 'COMBO' : String(type),
+          values: values,
+          options: opts,
+          required: s === 0,
+          'default': opts['default']
+        });
+      }
+    }
+    return out;
+  }
+
+  /* name -> raw value map of a workflow node's widgets. The frontend writes
+   * widgets_values_named (including dotted DynamicCombo names); older saves
+   * only carry an array of widget objects. */
+  function widgetValueMap(node) {
+    var map = {};
+    var named = node && node.widgets_values_named;
+    if (isPlainObject(named)) {
+      for (var key in named) {
+        if (Object.prototype.hasOwnProperty.call(named, key)) map[key] = named[key];
+      }
+      return map;
+    }
+    var widgets = node && node.widgets;
+    if (Array.isArray(widgets)) {
+      for (var i = 0; i < widgets.length; i++) {
+        var widget = widgets[i];
+        if (widget && typeof widget.name === 'string') map[widget.name] = widget.value;
+      }
+    }
+    return map;
   }
 
   /* ------------------------------------------------------------------ */
@@ -1642,6 +1735,39 @@
           continue;
         }
         if (inputs[spec.name] === undefined) inputs[spec.name] = value;
+      }
+
+      /* 2b. DynamicCombo sub-inputs. ComfyUI expects the selected option and
+       * its parameters as flat "parent.child" keys; without them the backend
+       * drops the whole combo and fails inside execute(). */
+      if (specs.some(function (item) { return !!item.dynamic; })) {
+        var rawByName = widgetValueMap(node);
+        for (var d = 0; d < specs.length; d++) {
+          var dynamicSpec = specs[d];
+          if (!dynamicSpec.dynamic) continue;
+          var selected = inputs[dynamicSpec.name];
+          if (selected === undefined || isLinkRef(selected)) continue;
+          var nested = dynamicNestedSpecs(dynamicSpec, selected);
+          for (var dn = 0; dn < nested.length; dn++) {
+            var nestedSpec = nested[dn];
+            var nestedRaw = Object.prototype.hasOwnProperty.call(rawByName, nestedSpec.name)
+              ? rawByName[nestedSpec.name] : undefined;
+            var nestedValue;
+            if (Object.prototype.hasOwnProperty.call(nodeOverrides, nestedSpec.name)) {
+              nestedValue = coerce(nestedSpec, nodeOverrides[nestedSpec.name]);
+              if (nestedValue === undefined) nestedValue = coerce(nestedSpec, nestedRaw);
+            } else {
+              nestedValue = coerce(nestedSpec, nestedRaw);
+            }
+            if (nestedValue === undefined) {
+              if (nestedSpec.required) {
+                result.missing.push({ nodeId: node.id, nodeType: node.type, input: nestedSpec.name });
+              }
+              continue;
+            }
+            if (inputs[nestedSpec.name] === undefined) inputs[nestedSpec.name] = nestedValue;
+          }
+        }
       }
 
       /* 3. required inputs with neither widget nor link */

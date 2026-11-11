@@ -523,6 +523,137 @@ test('file names are allowed for image combos', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* DynamicCombo (TextGenerate sampling_mode)                           */
+/* ------------------------------------------------------------------ */
+
+console.log('\nconvert.js - DynamicCombo inputs');
+
+const DYNAMIC_INFO = Object.assign({}, OBJECT_INFO, {
+  TextGenerate: {
+    input: {
+      required: {
+        clip: ['CLIP'],
+        prompt: ['STRING', { multiline: true, default: '' }],
+        max_length: ['INT', { default: 512, min: 1, max: 32768 }],
+        sampling_mode: ['COMFY_DYNAMICCOMBO_V3', {
+          options: [
+            {
+              key: 'on',
+              inputs: {
+                required: {
+                  temperature: ['FLOAT', { default: 0.7, min: 0.01, max: 2, step: 0.000001 }],
+                  top_k: ['INT', { default: 64, min: 0, max: 1000 }],
+                  top_p: ['FLOAT', { default: 0.95, min: 0, max: 1, step: 0.01 }],
+                  min_p: ['FLOAT', { default: 0.05, min: 0, max: 1, step: 0.01 }],
+                  repetition_penalty: ['FLOAT', { default: 1.05, min: 0, max: 5, step: 0.01 }],
+                  seed: ['INT', { default: 0, min: 0, max: 0xffffffffffffffff }],
+                  presence_penalty: ['FLOAT', { default: 0, min: 0, max: 5, step: 0.01 }]
+                }
+              }
+            },
+            { key: 'off', inputs: { required: {} } }
+          ]
+        }]
+      },
+      optional: {
+        image: ['IMAGE'],
+        thinking: ['BOOLEAN', { default: false }],
+        use_default_template: ['BOOLEAN', { default: true }],
+        mtp: ['STRING', { default: 'auto' }],
+        system_prompt: ['STRING', { forceInput: true }]
+      }
+    },
+    output: ['STRING', 'STRING'],
+    name: 'TextGenerate'
+  }
+});
+
+function textGenWorkflow() {
+  return {
+    nodes: [
+      node(1, 'CheckpointLoaderSimple', {
+        widgets: ['sd15.safetensors'],
+        outputs: [out(1, 'CLIP', 'CLIP', [10])]
+      }),
+      node(522, 'TextGenerate', {
+        title: '#Text',
+        inputs: [txt(10, 'clip')],
+        outputs: [out(522, 'generated_text', 'STRING', [])],
+        widgets: ['', 512, 'on', 0.7, 20, 0.95, 0, 1.05, 891836227295376, 0, false, true, '2']
+      })
+    ],
+    links: [link(10, 1, 1, 522, 0, 'CLIP')]
+  };
+}
+
+function namedTextGenWorkflow() {
+  const wf = textGenWorkflow();
+  wf.nodes[1].widgets_values_named = {
+    prompt: '',
+    max_length: 512,
+    sampling_mode: 'on',
+    'sampling_mode.temperature': 0.7,
+    'sampling_mode.top_k': 20,
+    'sampling_mode.top_p': 0.95,
+    'sampling_mode.min_p': 0,
+    'sampling_mode.repetition_penalty': 1.05,
+    'sampling_mode.seed': 891836227295376,
+    'sampling_mode.presence_penalty': 0,
+    thinking: false,
+    use_default_template: true,
+    mtp: '2'
+  };
+  return wf;
+}
+
+test('sampling_mode is sent as the option key, not as an option object', () => {
+  const p = Convert.buildPrompt(namedTextGenWorkflow(), DYNAMIC_INFO, {});
+  eq(p.errors, [], 'errors');
+  eq(p.prompt['522'].inputs.sampling_mode, 'on', 'sampling_mode');
+});
+
+test('dynamic combo parameters are sent as flat parent.child inputs', () => {
+  const p = Convert.buildPrompt(namedTextGenWorkflow(), DYNAMIC_INFO, {});
+  const inputs = p.prompt['522'].inputs;
+  eq(inputs['sampling_mode.temperature'], 0.7, 'temperature');
+  eq(inputs['sampling_mode.top_k'], 20, 'top_k');
+  eq(inputs['sampling_mode.min_p'], 0, 'min_p');
+  eq(inputs['sampling_mode.repetition_penalty'], 1.05, 'repetition_penalty');
+  eq(inputs['sampling_mode.seed'], 891836227295376, 'seed');
+  eq(inputs['sampling_mode.presence_penalty'], 0, 'presence_penalty');
+});
+
+test('switching the dynamic combo off removes its parameters', () => {
+  const p = Convert.buildPrompt(namedTextGenWorkflow(), DYNAMIC_INFO, { 522: { sampling_mode: 'off' } });
+  const inputs = p.prompt['522'].inputs;
+  eq(inputs.sampling_mode, 'off', 'sampling_mode');
+  ok(!Object.keys(inputs).some((k) => k.indexOf('sampling_mode.') === 0), 'no nested inputs');
+});
+
+test('dynamic combo parameters can be overridden by their dotted name', () => {
+  const p = Convert.buildPrompt(namedTextGenWorkflow(), DYNAMIC_INFO, { 522: { 'sampling_mode.temperature': '1.2' } });
+  eq(p.prompt['522'].inputs['sampling_mode.temperature'], 1.2, 'temperature');
+});
+
+test('missing dynamic combo parameters fall back to their defaults', () => {
+  const wf = textGenWorkflow();
+  wf.nodes[1].widgets_values_named = { prompt: '', max_length: 512, sampling_mode: 'on' };
+  const p = Convert.buildPrompt(wf, DYNAMIC_INFO, {});
+  eq(p.prompt['522'].inputs['sampling_mode.temperature'], 0.7, 'temperature default');
+  eq(p.prompt['522'].inputs['sampling_mode.top_k'], 64, 'top_k default');
+});
+
+test('the panel gets a plain on/off dropdown for sampling_mode', () => {
+  const m = Convert.buildModel(namedTextGenWorkflow(), DYNAMIC_INFO);
+  const gen = m.exposed.filter((n) => n.id === 522)[0];
+  ok(gen, 'node exposed');
+  const mode = gen.widgets.filter((w) => w.name === 'sampling_mode')[0];
+  eq(mode.kind, 'combo', 'kind');
+  eq(mode.values, ['on', 'off'], 'values');
+  eq(mode.value, 'on', 'value');
+});
+
+/* ------------------------------------------------------------------ */
 /* API format                                                          */
 /* ------------------------------------------------------------------ */
 
