@@ -10,6 +10,7 @@ Photoshop UXP panel for running ComfyUI workflows and inserting the result as a 
 - Rename a widget (input) inside a `#` node so its label starts with `#` (e.g. `#megapixels`) to show only the parameters you actually want to edit. As soon as a workflow contains at least one marked widget, every `#` node shows only its marked widgets.
 - Each `#` image input gets its own `Send all` / `Send layer` block with a preview. The first image input always has one; additional inputs appear when the `LoadImage` node (or its image widget) is marked with `#`.
 - `Send all` captures the flattened active document, `Send layer` captures the active layer. The sent image appears in that block's preview immediately and is used by the next generation.
+- Pressing `x1`, `x2`, or `x5` when nothing has been sent yet sends the flattened active document automatically (the same as `Send all`), so a fresh start never falls back to the picture stored inside the workflow. If no document is open, nothing is queued and the status light turns red.
 - `Reload` re-reads the workflow and resets all parameters, seeds, sent images, and the selected output to the values stored in the workflow JSON.
 - UI-format workflows, API-format prompts, and workflows with ComfyUI subgraphs (both legacy and new definition formats) are accepted.
 - `x1`, `x2`, `x5` run the workflow one or more times (two buttons per row). Every returned image is inserted as a separate layer.

@@ -1153,19 +1153,30 @@
         (sent.width && sent.height ? ' (' + sent.width + 'x' + sent.height + ')' : '');
     } else {
       preview.style.display = 'none';
-      caption.textContent = 'Nothing sent yet. Open the needed document/layer in Photoshop and press Send all or Send layer.';
+      caption.textContent = 'Nothing sent yet. The active document is sent automatically on the next run, or press Send all / Send layer now.';
     }
     return card;
   }
 
   async function sendImageSource(img, kind) {
-    if (state.running || state.connecting || state.sending) return;
-    if (!state.connected) { log('Connect to ComfyUI first.', 'err'); return; }
+    if (state.running || state.connecting || state.sending) return false;
+    if (!state.connected) {
+      log('Connect to ComfyUI first.', 'err');
+      setStatus('error', 'bad');
+      return false;
+    }
+    return await uploadSourceImage(img, kind);
+  }
+
+  /* Capture and upload one image input. The caller has already checked the
+   * panel state; returns true when the upload succeeded. */
+  async function uploadSourceImage(img, kind) {
     state.sending = true;
     updateConnectionUI();
     var id = String(img.id);
     var title = img.title || ('Image #' + img.id);
     var exportResult = null;
+    var uploadedOk = false;
     try {
       setStatus('exporting ' + kind, 'busy');
       log('Sending ' + kind + ' as "' + title + '"...');
@@ -1192,6 +1203,7 @@
       saveWorkflowState();
       setStatus('ready', 'ok');
       log('Sent ' + kind + ' for "' + title + '".', 'ok');
+      uploadedOk = true;
     } catch (e) {
       log('Send failed: ' + friendlyError(e), 'err');
       setStatus('error', 'bad');
@@ -1203,6 +1215,7 @@
       }
       updateConnectionUI();
     }
+    return uploadedOk;
   }
 
   function randomSeed() { return Math.floor(Math.random() * 0x7fffffff); }
@@ -1373,7 +1386,11 @@
     if (!state.connected) { log('Connect to ComfyUI first.', 'err'); return null; }
     if (!state.model || !state.workflow) { log('No workflow selected.', 'err'); return null; }
     var docInfo = PS.documentInfoLight ? PS.documentInfoLight() : PS.documentInfo();
-    if (!docInfo) { log('Open a document in Photoshop first.', 'err'); return null; }
+    if (!docInfo) {
+      log('Open a document in Photoshop first.', 'err');
+      setStatus('error', 'bad');
+      return null;
+    }
     if (state.model.errors && state.model.errors.length) {
       log(friendlyError(new Error(state.model.errors[0])), 'err');
       return null;
@@ -1391,11 +1408,30 @@
       state.model = Convert.buildModel(state.workflow, state.objectInfo);
       if (state.model.errors && state.model.errors.length) throw new Error(state.model.errors[0]);
 
-      sourceImages().forEach(function (img) {
-        if (!state.sentImages[String(img.id)]) {
-          log('Image "' + (img.title || ('#' + img.id)) + '" was not sent - using the workflow image.', 'warn');
-        }
+      /* Fresh start: an image input that was never sent would silently use the
+       * picture stored in the workflow. Capture the active document instead
+       * ("Send all"), and stop with a red status if that is impossible.
+       * Partly sent workflows keep the manual choice and only warn. */
+      var imgs = sourceImages();
+      var unsent = imgs.filter(function (img) {
+        return !state.sentImages[String(img.id)];
       });
+      if (imgs.length && unsent.length === imgs.length) {
+        log('Nothing sent yet - sending the active document automatically...');
+        for (var u = 0; u < unsent.length; u++) {
+          var sentOk = await uploadSourceImage(unsent[u], 'document');
+          if (!sentOk) {
+            setStatus('error', 'bad');
+            setProgress(0);
+            log('Generation cancelled: send the image manually and try again.', 'err');
+            return null;
+          }
+        }
+      } else {
+        unsent.forEach(function (img) {
+          log('Image "' + (img.title || ('#' + img.id)) + '" was not sent - using the workflow image.', 'warn');
+        });
+      }
 
       for (var i = 0; i < count; i++) {
         if (state.cancelRequested) break;
