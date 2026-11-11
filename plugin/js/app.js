@@ -1207,6 +1207,17 @@
 
   function randomSeed() { return Math.floor(Math.random() * 0x7fffffff); }
 
+  /* Nodes whose seed the user pinned by clearing the "each" checkbox: batch
+   * runs keep that seed exactly as entered. */
+  function pinnedSeedNodes() {
+    var out = [];
+    var map = state.randomSeeds || {};
+    Object.keys(map).forEach(function (id) {
+      if (!map[id]) out.push(String(id));
+    });
+    return out;
+  }
+
   /* ------------------------------------------------------------------ */
   /* generation                                                         */
   /* ------------------------------------------------------------------ */
@@ -1280,7 +1291,11 @@
     var overrides = collectOverrides(state.model, total > 1);
 
     var built = Convert.buildPrompt(state.workflow, state.objectInfo, overrides, {
-      outputIds: state.outputId ? [state.outputId] : null
+      outputIds: state.outputId ? [state.outputId] : null,
+      /* x2 / x5 must not repeat the same picture: every seed in the prompt is
+       * re-rolled per run, including samplers that are not "#" nodes. */
+      varySeeds: total > 1 ? randomSeed : null,
+      pinnedSeedNodes: total > 1 ? pinnedSeedNodes() : null
     });
     if (built.errors.length) throw new Error(built.errors.join('\n'));
     (built.warnings || []).forEach(function (warning) { log(warning, 'warn'); });

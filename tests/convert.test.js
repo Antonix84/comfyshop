@@ -654,6 +654,74 @@ test('the panel gets a plain on/off dropdown for sampling_mode', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Batch runs: seed variation (x2 / x5)                                */
+/* ------------------------------------------------------------------ */
+
+console.log('\nconvert.js - batch seeds');
+
+function fixedSeedWorkflow() {
+  const wf = uiWorkflow();
+  wf.nodes.filter((n) => n.id === 6)[0].widgets_values_named = {
+    seed: 1234,
+    control_after_generate: 'fixed',
+    steps: 30,
+    cfg: 7.5,
+    sampler_name: 'euler',
+    scheduler: 'karras',
+    denoise: 0.9
+  };
+  return wf;
+}
+
+test('the stored seed is kept when no generator is passed', () => {
+  const p = Convert.buildPrompt(uiWorkflow(), OBJECT_INFO, {}, { outputIds: [10] });
+  eq(p.prompt['6'].inputs.seed, 1234, 'seed');
+});
+
+test('varySeeds replaces the seed of a non-exposed sampler', () => {
+  let n = 0;
+  const p = Convert.buildPrompt(uiWorkflow(), OBJECT_INFO, {}, {
+    outputIds: [10],
+    varySeeds: () => { n += 1; return 500000 + n; }
+  });
+  eq(p.prompt['6'].inputs.seed, 500001, 'seed');
+  eq(p.prompt['6'].inputs.steps, 30, 'steps untouched');
+});
+
+test('every run gets its own seed', () => {
+  let n = 0;
+  const gen = () => { n += 1; return 700000 + n; };
+  const a = Convert.buildPrompt(uiWorkflow(), OBJECT_INFO, {}, { outputIds: [10], varySeeds: gen });
+  const b = Convert.buildPrompt(uiWorkflow(), OBJECT_INFO, {}, { outputIds: [10], varySeeds: gen });
+  ok(a.prompt['6'].inputs.seed !== b.prompt['6'].inputs.seed, 'seeds differ');
+});
+
+test('a seed marked "fixed" in the workflow is not varied', () => {
+  const p = Convert.buildPrompt(fixedSeedWorkflow(), OBJECT_INFO, {}, {
+    outputIds: [10],
+    varySeeds: () => 999999
+  });
+  eq(p.prompt['6'].inputs.seed, 1234, 'pinned seed');
+});
+
+test('pinnedSeedNodes keeps the seed the user locked in the panel', () => {
+  const p = Convert.buildPrompt(uiWorkflow(), OBJECT_INFO, {}, {
+    outputIds: [10],
+    varySeeds: () => 999999,
+    pinnedSeedNodes: [6]
+  });
+  eq(p.prompt['6'].inputs.seed, 1234, 'pinned seed');
+});
+
+test('DynamicCombo sub-seeds are varied too', () => {
+  const p = Convert.buildPrompt(namedTextGenWorkflow(), DYNAMIC_INFO, {}, {
+    varySeeds: () => 424242
+  });
+  eq(p.prompt['522'].inputs['sampling_mode.seed'], 424242, 'sampling seed');
+  eq(p.prompt['522'].inputs['sampling_mode.temperature'], 0.7, 'temperature untouched');
+});
+
+/* ------------------------------------------------------------------ */
 /* API format                                                          */
 /* ------------------------------------------------------------------ */
 

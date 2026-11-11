@@ -704,6 +704,10 @@
 
   var SEED_NAMES = { seed: 1, noise_seed: 1, rand_seed: 1, random_seed: 1, global_seed: 1, 'value': 0 };
 
+  /* API-prompt inputs that hold a seed, including DynamicCombo sub-inputs
+   * such as "sampling_mode.seed". */
+  var SEED_INPUT = /(^|\.)(seed|noise_seed|rand_seed|random_seed|global_seed)$/i;
+
   var CONTROL_VALUES = { fixed: 1, increment: 1, decrement: 1, randomize: 1 };
 
   function isSeedWidget(spec) {
@@ -1332,6 +1336,26 @@
 
   /* Copy an API prompt, apply overrides and drop branches the chosen output
    * does not use. The original workflow object is never mutated. */
+  /* Batch runs (x2 / x5) need a fresh seed per run: with an unchanged prompt
+   * ComfyUI serves the cached result and every layer looks the same.
+   * fixedSeeds holds "<nodeId>::<input>" keys the workflow pins ("fixed"
+   * control); pinnedSeedNodes holds node ids the user locked in the panel. */
+  function varyPromptSeeds(prompt, options, fixedSeeds) {
+    var pinnedNodes = {};
+    (options.pinnedSeedNodes || []).forEach(function (id) { pinnedNodes[String(id)] = true; });
+    Object.keys(prompt).forEach(function (id) {
+      if (pinnedNodes[id]) return;
+      var inputs = prompt[id].inputs || {};
+      Object.keys(inputs).forEach(function (key) {
+        if (!SEED_INPUT.test(key)) return;
+        if (fixedSeeds && fixedSeeds[id + '::' + key]) return;
+        if (typeof inputs[key] !== 'number') return;
+        inputs[key] = options.varySeeds();
+      });
+    });
+    return prompt;
+  }
+
   function buildApiPrompt(prompt, objectInfo, overrides, options) {
     objectInfo = objectInfo || {};
     options = options || {};
@@ -1373,6 +1397,10 @@
       });
     }
     if (options.prune !== false) result.prompt = pruneGraph(result.prompt, roots, result);
+
+    if (typeof options.varySeeds === 'function') {
+      result.prompt = varyPromptSeeds(result.prompt, options, null);
+    }
 
     var kept = Object.keys(result.prompt);
     kept.forEach(function (id) {
@@ -1677,6 +1705,7 @@
     var unknownIds = {};
     var unknownById = {};
     var unknownWarned = {};
+    var fixedSeeds = {};
 
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
@@ -1735,6 +1764,12 @@
           continue;
         }
         if (inputs[spec.name] === undefined) inputs[spec.name] = value;
+
+        /* Remember seeds the workflow itself pins ("fixed" control), so batch
+         * runs do not override a deliberate choice. */
+        if (SEED_INPUT.test(spec.name) && aligned.controls && aligned.controls[w] === 'fixed') {
+          fixedSeeds[String(node.id) + '::' + spec.name] = true;
+        }
       }
 
       /* 2b. DynamicCombo sub-inputs. ComfyUI expects the selected option and
@@ -1798,6 +1833,12 @@
 
     /* 4. prune branches the requested output(s) never reach */
     if (options.prune !== false) result.prompt = pruneGraph(result.prompt, roots, result);
+
+    /* 4b. batch runs (x2 / x5): give every seed a new value, otherwise the
+     * server returns the cached identical picture. */
+    if (typeof options.varySeeds === 'function') {
+      result.prompt = varyPromptSeeds(result.prompt, options, fixedSeeds);
+    }
 
     var kept = Object.keys(result.prompt);
 
