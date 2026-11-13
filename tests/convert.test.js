@@ -718,11 +718,23 @@ test('pinnedSeedNodes keeps the seed the user locked in the panel', () => {
   eq(p.prompt['6'].inputs.seed, 1234, 'pinned seed');
 });
 
-test('DynamicCombo sub-seeds are varied too', () => {
+test('increment seeds advance by the run index', () => {
+  const wf = uiWorkflow();
+  const sampler = wf.nodes.filter((n) => n.id === 6)[0];
+  sampler.widgets_values = [100, 'increment', 30, 7.5, 'euler', 'karras', 0.9];
+  const p = Convert.buildPrompt(wf, OBJECT_INFO, {}, {
+    outputIds: [10],
+    varySeeds: () => 999999,
+    seedRunIndex: 3
+  });
+  eq(p.prompt['6'].inputs.seed, 103, 'seed advanced');
+});
+
+test('DynamicCombo sub-seeds are not re-rolled: the text prompt stays cached', () => {
   const p = Convert.buildPrompt(namedTextGenWorkflow(), DYNAMIC_INFO, {}, {
     varySeeds: () => 424242
   });
-  eq(p.prompt['522'].inputs['sampling_mode.seed'], 424242, 'sampling seed');
+  eq(p.prompt['522'].inputs['sampling_mode.seed'], 891836227295376, 'sampling seed untouched');
   eq(p.prompt['522'].inputs['sampling_mode.temperature'], 0.7, 'temperature untouched');
 });
 

@@ -1,7 +1,7 @@
 {
   "id": "com.comfyshop.panel",
   "name": "ComfyShop",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "main": "index.html",
   "manifestVersion": 5,
   "host": {

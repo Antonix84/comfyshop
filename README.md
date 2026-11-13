@@ -17,7 +17,9 @@ Photoshop UXP panel for running ComfyUI workflows and inserting the result as a 
 - Connects automatically on startup and reconnects every 7 s after the connection is lost (a single lightweight health check every 10 s).
 - `Stop` interrupts the current generation.
 - Result layers are named `<workflow> <time> <duration>`.
-- Batch runs (`x2`, `x5`) give every seed in the graph a new value, including samplers that are not `#` nodes, so each run is a different picture. A seed marked `fixed` in ComfyUI, or one whose `each` checkbox was cleared, keeps its value.
+- Batch runs (`x2`, `x5`) follow the seed controls saved in the workflow, exactly like the ComfyUI queue: `randomize` seeds get a new value, `increment` / `decrement` step by one, and `fixed` seeds keep their value. Cached nodes are therefore reused, so a fixed-seed text prompt generator runs only once instead of on every image. A seed whose `each` checkbox was cleared is always pinned.
+- Results are inserted into the document the image was sent from, even if you switch to another picture while the generation is running. The panel gives the focus back to the picture you are working on afterwards.
+- If Photoshop is in a modal state (a dialog, Camera Raw, a filter), the panel does not fail: generated layers are kept and inserted as soon as Photoshop is free again, in order, including several images from an `x5` run.
 - Layer exports keep transparency; results are scaled and placed back into the exported area.
 - Only the part of the graph that feeds the selected output is sent to ComfyUI, so unrelated nodes with missing custom packs do not block a run.
 

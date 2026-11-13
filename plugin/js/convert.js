@@ -1364,13 +1364,14 @@
     return result;
   }
 
-  /* Copy an API prompt, apply overrides and drop branches the chosen output
-   * does not use. The original workflow object is never mutated. */
-  /* Batch runs (x2 / x5) need a fresh seed per run: with an unchanged prompt
-   * ComfyUI serves the cached result and every layer looks the same.
-   * fixedSeeds holds "<nodeId>::<input>" keys the workflow pins ("fixed"
-   * control); pinnedSeedNodes holds node ids the user locked in the panel. */
-  function varyPromptSeeds(prompt, options, fixedSeeds) {
+  /* Batch runs (x2 / x5) follow the seed behaviour saved in the workflow, the
+   * same way the ComfyUI queue does: "randomize" gets a new seed, increment /
+   * decrement step by one, and "fixed" seeds keep their value so cached nodes
+   * (for example a text prompt generator) are not recomputed. Seeds the user
+   * locked from the panel (pinnedSeedNodes) always keep their value. */
+  function varyPromptSeeds(prompt, options, seedControls) {
+    if (!seedControls) return prompt;   /* API prompts carry no control info */
+    var runIndex = Number(options.seedRunIndex) || 0;
     var pinnedNodes = {};
     (options.pinnedSeedNodes || []).forEach(function (id) { pinnedNodes[String(id)] = true; });
     Object.keys(prompt).forEach(function (id) {
@@ -1378,14 +1379,19 @@
       var inputs = prompt[id].inputs || {};
       Object.keys(inputs).forEach(function (key) {
         if (!SEED_INPUT.test(key)) return;
-        if (fixedSeeds && fixedSeeds[id + '::' + key]) return;
+        var control = seedControls[id + '::' + key];
+        if (!control || control === 'fixed') return;
         if (typeof inputs[key] !== 'number') return;
+        if (control === 'increment') { inputs[key] = inputs[key] + runIndex; return; }
+        if (control === 'decrement') { inputs[key] = inputs[key] - runIndex; return; }
         inputs[key] = options.varySeeds();
       });
     });
     return prompt;
   }
 
+  /* Copy an API prompt, apply overrides and drop branches the chosen output
+   * does not use. The original workflow object is never mutated. */
   function buildApiPrompt(prompt, objectInfo, overrides, options) {
     objectInfo = objectInfo || {};
     options = options || {};
@@ -1427,10 +1433,6 @@
       });
     }
     if (options.prune !== false) result.prompt = pruneGraph(result.prompt, roots, result);
-
-    if (typeof options.varySeeds === 'function') {
-      result.prompt = varyPromptSeeds(result.prompt, options, null);
-    }
 
     var kept = Object.keys(result.prompt);
     kept.forEach(function (id) {
@@ -1735,7 +1737,7 @@
     var unknownIds = {};
     var unknownById = {};
     var unknownWarned = {};
-    var fixedSeeds = {};
+    var seedControls = {};
 
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
@@ -1795,10 +1797,13 @@
         }
         if (inputs[spec.name] === undefined) inputs[spec.name] = value;
 
-        /* Remember seeds the workflow itself pins ("fixed" control), so batch
-         * runs do not override a deliberate choice. */
-        if (SEED_INPUT.test(spec.name) && aligned.controls && aligned.controls[w] === 'fixed') {
-          fixedSeeds[String(node.id) + '::' + spec.name] = true;
+        /* Remember how the workflow drives each seed: only "randomize" (and
+         * increment/decrement) may change between batch runs. A fixed seed
+         * keeps its value, so ComfyUI can reuse its cache. */
+        if (SEED_INPUT.test(spec.name)) {
+          var control = (aligned.controls && aligned.controls[w]) ||
+            (spec.options && spec.options.control_after_generate ? 'randomize' : null);
+          if (control) seedControls[String(node.id) + '::' + spec.name] = control;
         }
       }
 
@@ -1864,10 +1869,11 @@
     /* 4. prune branches the requested output(s) never reach */
     if (options.prune !== false) result.prompt = pruneGraph(result.prompt, roots, result);
 
-    /* 4b. batch runs (x2 / x5): give every seed a new value, otherwise the
-     * server returns the cached identical picture. */
+    /* 4b. batch runs (x2 / x5): vary seeds the workflow marks as random, so a
+     * batch is not the cached copy of one picture; fixed seeds stay untouched
+     * and cached nodes (text prompt generation) are reused. */
     if (typeof options.varySeeds === 'function') {
-      result.prompt = varyPromptSeeds(result.prompt, options, fixedSeeds);
+      result.prompt = varyPromptSeeds(result.prompt, options, seedControls);
     }
 
     var kept = Object.keys(result.prompt);

@@ -47,6 +47,14 @@
     return doc;
   }
 
+  function findDocumentById(id) {
+    if (id === undefined || id === null || !app || !app.documents) return null;
+    for (var i = 0; i < app.documents.length; i++) {
+      if (app.documents[i] && app.documents[i].id === id) return app.documents[i];
+    }
+    return null;
+  }
+
   function uniqueName(prefix) {
     return prefix + '_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e6).toString(36);
   }
@@ -402,21 +410,24 @@
       height: meta.height,
       docWidth: Math.round(source.width),
       docHeight: Math.round(source.height),
-      sourceDocId: sourceId
+      sourceDocId: sourceId,
+      sourceDocName: source.name
     };
   }
 
-  /* Insert an image file into the active document as a new layer.
+  /* Insert an image file into a document as a new layer.
    *
    * A generated PNG is opened as a temporary document, its single raster
    * layer is duplicated into the target document, and the temporary document
    * is closed. This avoids File > Place / placeEvent, which leaves Photoshop
    * waiting in Free Transform mode when called from a UXP panel.
    *
-   * options: { origin:{x,y}, name, width, height }
+   * options: { origin:{x,y}, name, width, height, documentId }
+   *   documentId: target document (defaults to the active one); the panel
+   *   passes the document the generation was started from.
    *   width/height: target size in the destination document (the generated
    *   image is scaled to it when they differ).
-   * Returns { layerId, layerName, bounds }.
+   * Returns { layerId, layerName, bounds, documentId, documentName }.
    */
 
   function descriptorValue(v) {
@@ -498,7 +509,13 @@
     var layerName = options.name || ('ComfyShop ' + new Date().toLocaleTimeString());
 
     return withModal(async function () {
-      var target = activeDocument();
+      /* Insert into the document the image came from, even when the user has
+       * switched to another picture while the generation was running. */
+      var previousId = app.activeDocument ? app.activeDocument.id : null;
+      var target = findDocumentById(options.documentId) || (!options.documentId ? app.activeDocument : null);
+      if (!target) {
+        throw new Error('The document this generation was started from is closed. Open it again and send the image anew.');
+      }
       var targetId = target.id;
       var temp = null;
 
@@ -527,19 +544,13 @@
           }], { documentID: temp.id });
         } catch (dupError) {
           // DOM fallback if the raw descriptor is rejected.
-          var targetDoc = null;
-          for (var t = 0; t < app.documents.length; t++) {
-            if (app.documents[t].id === targetId) { targetDoc = app.documents[t]; break; }
-          }
+          var targetDoc = findDocumentById(targetId);
           if (!targetDoc) throw dupError;
           await tempLayer.duplicate(targetDoc);
         }
 
         // Re-acquire the target document (opening the temp doc changed focus).
-        var doc = null;
-        for (var i = 0; i < app.documents.length; i++) {
-          if (app.documents[i].id === targetId) { doc = app.documents[i]; break; }
-        }
+        var doc = findDocumentById(targetId);
         if (!doc) throw new Error('The original document was closed during insertion.');
         app.activeDocument = doc;
 
@@ -571,10 +582,11 @@
         if (temp) {
           try { await temp.close(constants.SaveOptions.DONOTSAVECHANGES); } catch (e) { /* ignore */ }
         }
+        /* Return the focus to the picture the user is working on. */
         try {
-          for (var j = 0; j < app.documents.length; j++) {
-            if (app.documents[j].id === targetId) { app.activeDocument = app.documents[j]; break; }
-          }
+          var back = previousId && previousId !== targetId ? findDocumentById(previousId) : null;
+          if (!back) back = findDocumentById(targetId);
+          if (back) app.activeDocument = back;
         } catch (e) { /* ignore */ }
       }
     }, 'ComfyShop insert');

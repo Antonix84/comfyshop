@@ -76,6 +76,9 @@
     lastResult: null,
     panelRoot: null,
     batch: { total: 0, done: 0 },
+    /* Results that could not be inserted yet because Photoshop was in a modal
+     * state (dialog, Camera Raw, filter). They are flushed in order later. */
+    pendingInserts: [],
     els: {}
   };
 
@@ -941,10 +944,11 @@
     saveWorkflowState();
   }
 
-  function seedRandomEnabled(nodeId, widget, force) {
+  /* Only seeds the workflow drives as "randomize" change by themselves; the
+   * "each" checkbox overrides this in both directions. */
+  function seedRandomEnabled(nodeId, widget) {
     var key = String(nodeId);
     if (Object.prototype.hasOwnProperty.call(state.randomSeeds, key)) return !!state.randomSeeds[key];
-    if (force) return true;
     return widget.seedControl === 'randomize';
   }
 
@@ -1198,6 +1202,9 @@
         height: exportResult.height || exportResult.docHeight || 0,
         docWidth: exportResult.docWidth || 0,
         docHeight: exportResult.docHeight || 0,
+        /* Which document this image came from: the result is inserted there. */
+        docId: exportResult.sourceDocId,
+        docName: exportResult.sourceDocName || '',
         sentAt: Date.now()
       };
       saveWorkflowState();
@@ -1220,6 +1227,69 @@
 
   function randomSeed() { return Math.floor(Math.random() * 0x7fffffff); }
 
+  function sleep(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+
+  /* Photoshop refuses scripting while a dialog, Camera Raw or a filter is
+   * open ("host is in a modal state"). That is not an error for us: wait and
+   * insert the layers once the host is free again. */
+  function isModalBusyError(err) {
+    var text = String((err && (err.message || err)) || '');
+    var code = String((err && err.code) || '');
+    return /modal/i.test(text) || /modal/i.test(code);
+  }
+
+  async function insertResultImage(arrayBuffer, options) {
+    var temp = await PS.getTempFile('comfyshop_result_' + Date.now() + '_' +
+      Math.random().toString(36).slice(2, 8) + '.png');
+    try {
+      await PS.writeEntryBytes(temp, arrayBuffer);
+      return await PS.insertFile(temp, options);
+    } finally {
+      try { await PS.deleteEntry(temp); } catch (e) { /* ignore */ }
+    }
+  }
+
+  /* Try to insert now; keep the image when Photoshop is busy so a batch of x5
+   * is not lost just because the user opened a dialog. */
+  async function insertOrQueue(item) {
+    try {
+      return await insertResultImage(item.buffer, item.options);
+    } catch (e) {
+      if (!isModalBusyError(e)) throw e;
+      state.pendingInserts.push(item);
+      debugLog('insert queued: ' + (e && (e.message || e)));
+      return null;
+    }
+  }
+
+  /* Insert queued results in order, waiting while Photoshop is modal. */
+  async function flushPendingInserts() {
+    if (!state.pendingInserts.length) return 0;
+    var inserted = 0;
+    log('Waiting to insert ' + state.pendingInserts.length + ' generated layer(s)...', 'warn');
+    while (state.pendingInserts.length) {
+      if (state.cancelRequested) break;
+      var item = state.pendingInserts[0];
+      try {
+        var result = await insertResultImage(item.buffer, item.options);
+        state.pendingInserts.shift();
+        inserted++;
+        state.lastResult = { layerName: result.layerName, image: null, index: null };
+        log('Inserted layer "' + result.layerName + '".', 'ok');
+        debugLog('queued insert done: ' + result.layerName);
+      } catch (e) {
+        if (!isModalBusyError(e)) {
+          state.pendingInserts.shift();
+          log('Insert failed: ' + friendlyError(e), 'err');
+          continue;
+        }
+        setStatus('waiting for Photoshop', 'busy');
+        await sleep(1000);
+      }
+    }
+    return inserted;
+  }
+
   /* Nodes whose seed the user pinned by clearing the "each" checkbox: batch
    * runs keep that seed exactly as entered. */
   function pinnedSeedNodes() {
@@ -1235,7 +1305,7 @@
   /* generation                                                         */
   /* ------------------------------------------------------------------ */
 
-  function collectOverrides(model, forceRandomSeeds) {
+  function collectOverrides(model) {
     var overrides = {};
 
     function put(nodeId, name, value) {
@@ -1249,7 +1319,7 @@
         if (widget.name === 'image' && node.isLoadImage) return;
         var raw = getValue(node.id, widget);
         if (raw === undefined) return;
-        if (widget.isSeed && seedRandomEnabled(node.id, widget, forceRandomSeeds)) raw = randomSeed();
+        if (widget.isSeed && seedRandomEnabled(node.id, widget)) raw = randomSeed();
         if (widget.kind === 'int') put(node.id, widget.name, Math.round(Number(raw)));
         else if (widget.kind === 'float') put(node.id, widget.name, Number(raw));
         else if (widget.kind === 'boolean') put(node.id, widget.name, !!raw);
@@ -1301,13 +1371,15 @@
   async function runOne(index, total) {
     var runStarted = Date.now();
     var host = Comfy.normalizeHost(settings.host);
-    var overrides = collectOverrides(state.model, total > 1);
+    var overrides = collectOverrides(state.model);
 
     var built = Convert.buildPrompt(state.workflow, state.objectInfo, overrides, {
       outputIds: state.outputId ? [state.outputId] : null,
-      /* x2 / x5 must not repeat the same picture: every seed in the prompt is
-       * re-rolled per run, including samplers that are not "#" nodes. */
+      /* x2 / x5 follow the seed controls saved in the workflow: random seeds
+       * are re-rolled, fixed ones stay, so cached nodes (prompt generation)
+       * are not recomputed. */
       varySeeds: total > 1 ? randomSeed : null,
+      seedRunIndex: total > 1 ? index : 0,
       pinnedSeedNodes: total > 1 ? pinnedSeedNodes() : null
     });
     if (built.errors.length) throw new Error(built.errors.join('\n'));
@@ -1345,6 +1417,8 @@
     var origin = meta && meta.origin ? meta.origin : { x: 0, y: 0 };
     var targetWidth = meta && meta.width ? meta.width : (meta ? meta.docWidth : 0);
     var targetHeight = meta && meta.height ? meta.height : (meta ? meta.docHeight : 0);
+    /* The document the image was sent from, not whatever is open right now. */
+    var targetDocId = meta ? meta.docId : null;
 
     var lastInserted = null;
 
@@ -1358,19 +1432,22 @@
       setStatus('inserting layer ' + (index + 1) + '/' + total +
         (images.length > 1 ? ' (' + (n + 1) + '/' + images.length + ')' : ''), 'busy');
 
-      var temp = await PS.getTempFile('comfyshop_result_' + Date.now() + '_' + n + '.png');
-      try {
-        await PS.writeEntryBytes(temp, arrayBuffer);
-        lastInserted = await PS.insertFile(temp, {
-          name: runName + (images.length > 1 ? ' ' + (n + 1) : ''),
-          origin: origin,
-          width: targetWidth || size.width,
-          height: targetHeight || size.height
-        });
-      } finally {
-        try { await PS.deleteEntry(temp); } catch (e) { /* ignore */ }
+      var insertOptions = {
+        name: runName + (images.length > 1 ? ' ' + (n + 1) : ''),
+        origin: origin,
+        width: targetWidth || size.width,
+        height: targetHeight || size.height,
+        documentId: targetDocId
+      };
+
+      var inserted = await insertOrQueue({ buffer: arrayBuffer, options: insertOptions });
+      if (!inserted) {
+        log('Photoshop is busy (a dialog or Camera Raw is open) - "' + insertOptions.name +
+          '" will be inserted as soon as it is free.', 'warn');
+        continue;
       }
 
+      lastInserted = inserted;
       debugLog('inserted layer ' + lastInserted.layerId + ' "' + lastInserted.layerName +
         '" bounds=' + JSON.stringify(lastInserted.bounds));
       state.lastResult = { layerName: lastInserted.layerName, image: image, index: index + 1 };
@@ -1441,6 +1518,10 @@
         setProgress(((i + 1) / count) * 100);
       }
 
+      /* Results that hit a modal Photoshop state are inserted now, waiting as
+       * long as needed (x5 can leave several of them queued). */
+      if (state.pendingInserts.length) await flushPendingInserts();
+
       var seconds = ((Date.now() - started) / 1000).toFixed(1);
       if (state.cancelRequested && state.batch.done < count) {
         setStatus('stopped', 'bad');
@@ -1449,6 +1530,10 @@
         setProgress(100);
         setStatus('done', 'ok');
         log('Generated ' + state.batch.done + '/' + count + ' image(s) in ' + seconds + 's.', 'ok');
+      }
+      if (state.pendingInserts.length) {
+        log(state.pendingInserts.length + ' generated layer(s) are still waiting for Photoshop. ' +
+          'They will be inserted after the next run.', 'warn');
       }
       saveWorkflowState();
       updateDocHint();
